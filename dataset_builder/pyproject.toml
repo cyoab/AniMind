@@ -1,0 +1,38 @@
+[project]
+name = "animind-dataset"
+version = "0.1.0"
+description = "Terminal-first Jikan dataset builder for user preference + anime enrichment"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.28.0",
+  "pydantic>=2.11.0",
+  "rich>=14.0.0",
+  "typer>=0.16.0",
+  "pandas>=2.2.0",
+  "pyarrow>=20.0.0",
+]
+
+[project.scripts]
+animind-dataset = "animind_dataset.cli:app"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4.0",
+  "pytest-asyncio>=1.2.0",
+]
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/animind_dataset"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
