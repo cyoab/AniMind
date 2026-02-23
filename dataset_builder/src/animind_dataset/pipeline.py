@@ -84,6 +84,12 @@ async def run_build(
                     concurrency=settings.concurrency,
                     callback=user_callback,
                 )
+                user_anime_rows = storage.count_user_anime_rows(resolved_run_id)
+                if user_anime_rows == 0:
+                    raise RuntimeError(
+                        "No user anime list rows were ingested. "
+                        "The run is incomplete (likely endpoint mismatch, private users, or sustained rate limiting)."
+                    )
                 anime_progress = await ingest_anime_enrichment(
                     client=client,
                     storage=storage,

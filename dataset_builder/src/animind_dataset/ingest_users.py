@@ -20,10 +20,15 @@ async def ingest_user_preferences(
     concurrency: int,
     callback: UserCallback = None,
 ) -> UserProgress:
-    usernames = storage.get_usernames_for_ingestion(run_id, limit=target_users)
     progress = UserProgress()
     progress_lock = asyncio.Lock()
     semaphore = asyncio.Semaphore(max(1, concurrency))
+    attempted_usernames: set[str] = set()
+
+    existing_success = storage.user_state_counts(run_id).get("success", 0)
+    target_success = max(0, target_users - existing_success)
+    if target_success == 0:
+        return progress
 
     async def update_progress(on_success: str | None = None) -> None:
         async with progress_lock:
@@ -37,7 +42,7 @@ async def ingest_user_preferences(
             elif on_success == "error":
                 progress.errors += 1
             if callback:
-                callback(progress, len(usernames))
+                callback(progress, target_success)
 
     async def worker(username: str) -> None:
         async with semaphore:
@@ -85,5 +90,25 @@ async def ingest_user_preferences(
                 storage.set_user_crawl_state(run_id, username, "error", str(exc))
                 await update_progress("error")
 
-    await asyncio.gather(*(worker(username) for username in usernames))
+    batch_size = max(target_users, max(250, concurrency * 50))
+    stale_rounds = 0
+    max_stale_rounds = 3
+
+    while progress.success < target_success:
+        candidates = storage.get_usernames_for_ingestion(run_id, limit=batch_size)
+        usernames = [username for username in candidates if username not in attempted_usernames]
+        if not usernames:
+            break
+
+        attempted_usernames.update(usernames)
+        success_before = progress.success
+        await asyncio.gather(*(worker(username) for username in usernames))
+
+        if progress.success == success_before:
+            stale_rounds += 1
+            if stale_rounds >= max_stale_rounds:
+                break
+        else:
+            stale_rounds = 0
+
     return progress

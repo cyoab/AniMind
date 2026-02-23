@@ -12,6 +12,7 @@ VALID_USER_STATUSES = {
     "completed": "completed",
     "on_hold": "on_hold",
     "on hold": "on_hold",
+    "onhold": "on_hold",
     "dropped": "dropped",
     "plan_to_watch": "plan_to_watch",
     "plan to watch": "plan_to_watch",

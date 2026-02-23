@@ -87,8 +87,9 @@ async def test_partial_failure_then_resume_continuation(tmp_path: Path) -> None:
     storage = DatasetStorage(out_dir / "state.sqlite3")
     second_stats = storage.get_stats(run_id)
     storage.close()
-    assert second_stats.users_errors == 0
     assert second_stats.users_success >= 20
+    assert second_stats.users_success >= first_stats.users_success
+    assert second_stats.users_errors <= first_stats.users_errors
 
 
 @pytest.mark.asyncio
@@ -174,3 +175,25 @@ async def test_anime_dedup_integrity_across_reruns(tmp_path: Path) -> None:
 
     assert duplicate_review_keys == 0
     assert duplicate_staff_keys == 0
+
+
+@pytest.mark.asyncio
+async def test_ingestion_continues_beyond_initial_batch_until_success_target(tmp_path: Path) -> None:
+    out_dir = tmp_path / "output"
+    missing = {f"user{i}" for i in range(1, 31)}
+
+    result = await run_build(
+        out_dir=out_dir,
+        target_users=5,
+        include_nsfw=True,
+        review_limit=50,
+        settings=Settings(concurrency=4, rate_limit_per_second=100),
+        client=FakeJikanClient(FakeClientConfig(user_count=40, missing_users=missing)),
+    )
+
+    storage = DatasetStorage(out_dir / "state.sqlite3")
+    stats = storage.get_stats(result.run_id)
+    storage.close()
+
+    assert stats.users_success >= 5
+    assert stats.user_anime_rows > 0

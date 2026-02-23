@@ -51,6 +51,11 @@ def _print_stats_table(storage: DatasetStorage, run_id: str) -> None:
     table.add_row("Anime reviews rows", str(stats.anime_reviews_rows))
 
     console.print(table)
+    if stats.user_anime_rows == 0:
+        console.print(
+            "[bold yellow]Warning:[/bold yellow] no user anime rows were ingested for this run. "
+            "Dataset export is incomplete."
+        )
 
 
 @app.command()

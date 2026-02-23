@@ -28,6 +28,10 @@ class JikanTemporaryError(JikanError):
     pass
 
 
+class JikanBadRequestError(JikanError):
+    pass
+
+
 @dataclass(slots=True)
 class RequestTelemetry:
     total_requests: int = 0
@@ -101,6 +105,8 @@ class JikanClient:
                 raise JikanNotFoundError(path)
             if response.status_code in (401, 403):
                 raise JikanForbiddenError(path)
+            if response.status_code == 400:
+                raise JikanBadRequestError(f"400 Bad Request for {path}")
 
             if response.status_code == 429:
                 self.telemetry.rate_limited += 1
@@ -135,14 +141,17 @@ class JikanClient:
         payload = await self._get_json(f"/users/{username}/full")
         return payload.get("data") or {}
 
-    async def fetch_user_animelist(self, username: str) -> list[dict[str, Any]]:
+    async def _fetch_user_animelist_paginated(
+        self,
+        username: str,
+        extra_params: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         page = 1
         rows: list[dict[str, Any]] = []
+        params = dict(extra_params or {})
         while True:
-            payload = await self._get_json(
-                f"/users/{username}/animelist",
-                params={"status": "all", "page": page},
-            )
+            params["page"] = page
+            payload = await self._get_json(f"/users/{username}/animelist", params=params)
             rows.extend(payload.get("data") or [])
             pagination = payload.get("pagination") or {}
             if not pagination.get("has_next_page"):
@@ -150,13 +159,42 @@ class JikanClient:
             page += 1
         return rows
 
+    async def fetch_user_animelist(self, username: str) -> list[dict[str, Any]]:
+        # Primary mode documented by Jikan: status=all.
+        try:
+            return await self._fetch_user_animelist_paginated(username, {"status": "all"})
+        except JikanBadRequestError:
+            # Some API revisions reject "all"; fallback to no status.
+            pass
+        except JikanNotFoundError:
+            pass
+
+        try:
+            return await self._fetch_user_animelist_paginated(username)
+        except JikanNotFoundError:
+            pass
+
+        # Final fallback: aggregate explicit statuses when aggregated endpoint is unavailable.
+        rows: list[dict[str, Any]] = []
+        for status in ("watching", "completed", "onhold", "dropped", "plantowatch"):
+            try:
+                rows.extend(await self._fetch_user_animelist_paginated(username, {"status": status}))
+            except JikanNotFoundError:
+                continue
+            except JikanBadRequestError:
+                continue
+
+        if rows:
+            return rows
+        raise JikanNotFoundError(f"/users/{username}/animelist")
+
     async def fetch_user_reviews(self, username: str, max_pages: int = 1) -> list[dict[str, Any]]:
         page = 1
         rows: list[dict[str, Any]] = []
         while page <= max_pages:
             payload = await self._get_json(
                 f"/users/{username}/reviews",
-                params={"type": "anime", "page": page},
+                params={"page": page},
             )
             rows.extend(payload.get("data") or [])
             pagination = payload.get("pagination") or {}

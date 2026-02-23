@@ -14,7 +14,7 @@ async def test_anime_review_pagination_stops_at_limit_50() -> None:
     seen_pages: list[int] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/anime/1/reviews":
+        if request.url.path.endswith("/anime/1/reviews"):
             page = int(request.url.params.get("page", "1"))
             seen_pages.append(page)
             has_next = page == 1

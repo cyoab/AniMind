@@ -292,6 +292,13 @@ class DatasetStorage:
         ).fetchone()
         return int(row["c"])
 
+    def count_user_anime_rows(self, run_id: str) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM user_anime_list WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        return int(row["c"])
+
     def user_state_counts(self, run_id: str) -> dict[str, int]:
         rows = self.conn.execute(
             "SELECT crawl_state, COUNT(*) as c FROM users WHERE run_id=? GROUP BY crawl_state",
@@ -305,7 +312,7 @@ class DatasetStorage:
             SELECT username
             FROM users
             WHERE run_id=?
-              AND crawl_state IN ('pending', 'error', 'rate_limited')
+              AND crawl_state IN ('pending', 'error', 'rate_limited', 'not_found')
             ORDER BY discovered_at, username
             LIMIT ?
             """,
