@@ -1,0 +1,40 @@
+services:
+  mongodb:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - jikan-mongodb:/data/db
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  jikan:
+    image: jikanme/jikan-rest:latest
+    restart: unless-stopped
+    depends_on:
+      - mongodb
+      - redis
+    ports:
+      - "8080:8080"
+    environment:
+      APP_ENV: production
+      CONTAINER: "true"
+      DB_CONNECTION: mongodb
+      DB_HOST: mongodb
+      DB_PORT: "27017"
+      DB_DATABASE: jikan
+      CACHE_STORE: redis
+      CACHING: "true"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      RATE_LIMIT: "true"
+      RATE_LIMIT_REDIS_CONNECTION: default
+
+volumes:
+  jikan-mongodb:
+

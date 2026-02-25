@@ -1,0 +1,2 @@
+"""AniMind dataset builder package."""
+
