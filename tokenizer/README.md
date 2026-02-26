@@ -22,6 +22,7 @@ Required sections:
 
 - `[prep]` for prep-phase settings
 - `[embedd]` for embedding-phase settings (intentionally named `embedd` for extensibility compatibility)
+- `[rqvae]` for RQ-VAE training settings
 
 Example:
 
@@ -42,6 +43,51 @@ batch_size = 8
 max_length = 2048
 device = "cuda"
 normalize = true
+
+[rqvae]
+tokenizer_db = "../output/tokenizer.sqlite"
+out_dir = "../output/rqvae"
+rebuild = true
+limit = 0
+device = "auto"
+seed = 42
+batch_size = 256
+epochs = 40
+num_workers = 4
+val_ratio = 0.05
+lr = 0.00004
+adam_beta1 = 0.5
+adam_beta2 = 0.9
+warmup_steps = 1000
+latent_dim = 256
+rq_levels = 8
+codebook_size = 2048
+commitment_beta = 0.25
+ema_decay = 0.99
+ema_eps = 0.00001
+restart_unused_codes = true
+amp = true
+checkpoint_every = 1
+encoder_hidden_dim = 1024
+decoder_hidden_dim = 1024
+dry_run = false
+dry_run_limit = 512
+dry_run_epochs = 1
+dry_run_batch_size = 32
+dry_run_num_workers = 0
+dry_run_out_subdir = "dry_run"
+env_file = "../.env"
+wandb_enabled = false
+wandb_mode = "offline"
+wandb_project = ""
+wandb_entity = ""
+wandb_api_key = ""
+wandb_run_name = ""
+wandb_group = ""
+wandb_tags = []
+wandb_project_env = "WANDB_PROJECT"
+wandb_entity_env = "WANDB_ENTITY"
+wandb_api_key_env = "WANDB_API_KEY"
 ```
 
 ## Phase: `prep`
@@ -81,6 +127,58 @@ uv run animind-tokenizer run \
 - `model_name TEXT NOT NULL`
 - `embedded_at TEXT NOT NULL`
 - `source_prepared_at TEXT`
+
+## Phase: `rqvae`
+
+`rqvae` trains a shared-codebook Residual-Quantized VAE over `anime_embeddings` and writes checkpoints and metrics.
+
+- Input table: `anime_embeddings`
+- Outputs directory: `output/rqvae` (configurable)
+- EMA codebook updates with random restarts for unused codes
+- Straight-through estimator: `z_quantized = z + (z_discrete - z).detach()`
+- Rich pipeline progress for load, split, init, train/val, checkpoint, and finalize stages
+- Optional W&B tracking (`offline`/`online`) configured in `[rqvae]`
+
+Run:
+
+```bash
+uv run animind-tokenizer run \
+  --phase rqvae \
+  --config ./config/tokenizer.toml
+```
+
+Artifacts:
+
+- `rqvae_best.pt`
+- `rqvae_last.pt`
+- `rqvae_config.json`
+- `rqvae_metrics.jsonl`
+- `code_usage.csv`
+
+### W&B + `.env`
+
+If `wandb_enabled=true`, the trainer resolves `project`, `entity`, and optional API key from:
+
+1. direct `[rqvae]` values (`wandb_project`, `wandb_entity`, `wandb_api_key`)
+2. env keys configured in `[rqvae]` (`wandb_*_env`) from `env_file`
+3. process environment variables
+
+For offline tracking:
+
+```bash
+WANDB_PROJECT=animind-tokenizer
+WANDB_ENTITY=my-team
+```
+
+in your `.env` and set `wandb_mode = "offline"`.
+
+### Dry-run
+
+Set `dry_run = true` in `[rqvae]` to execute a short safety run that:
+
+- caps rows and epochs
+- writes to `out_dir/<dry_run_out_subdir>`
+- validates checkpoint/metrics artifact integrity at the end
 
 ## Status and outputs
 
