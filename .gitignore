@@ -218,3 +218,4 @@ __marimo__/
 # Project outputs
 /output/
 /dataset_builder/output/
+/tokenizer/output/
