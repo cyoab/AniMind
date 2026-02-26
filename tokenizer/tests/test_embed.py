@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import sqlite3
+import math
 from pathlib import Path
 
 from typer.testing import CliRunner
 
 import animind_tokenizer.embed as embed_module
 from animind_tokenizer.cli import app
-from animind_tokenizer.embed import EmbedConfig, _resolve_device, blob_to_vector, run_embed
+from animind_tokenizer.embed import (
+    EmbedConfig,
+    _resolve_hf_token,
+    _load_hf_model,
+    _resolve_device,
+    _resolve_torch_dtype,
+    blob_to_vector,
+    run_embed,
+)
 
 
 class DummyBackend:
@@ -27,6 +36,11 @@ class DummyBackend:
 class AlternateBackend:
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         return [[9.0, 9.0, 9.0] for _ in texts]
+
+
+class NonFiniteBackend:
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        return [[math.nan, 0.0, 1.0] for _ in texts]
 
 
 class FakeCuda:
@@ -58,6 +72,23 @@ class FakeTorch:
     def __init__(self, *, available: bool, count: int, built: bool = True) -> None:
         self.cuda = FakeCuda(available=available, count=count)
         self.backends = FakeBackends(built=built)
+
+
+class FakeCudaPrecision:
+    def __init__(self, *, bf16: bool) -> None:
+        self._bf16 = bf16
+
+    def is_bf16_supported(self) -> bool:
+        return self._bf16
+
+
+class FakeTorchPrecision:
+    float16 = "float16"
+    bfloat16 = "bfloat16"
+    float32 = "float32"
+
+    def __init__(self, *, bf16: bool) -> None:
+        self.cuda = FakeCudaPrecision(bf16=bf16)
 
 
 def _create_tokenizer_db(path: Path, rows: list[tuple[int, str, str]]) -> None:
@@ -158,6 +189,24 @@ def test_embed_limit_is_applied(tmp_path: Path) -> None:
     assert count == 2
 
 
+def test_embed_rejects_non_finite_vectors(tmp_path: Path) -> None:
+    db_path = tmp_path / "tokenizer.sqlite"
+    _create_tokenizer_db(
+        db_path,
+        [(1, "Anime ID: 1; Name: One.", "2026-01-01T00:00:00+00:00")],
+    )
+
+    try:
+        run_embed(
+            EmbedConfig(tokenizer_db=db_path, rebuild=True, batch_size=1, model_name="dummy/model"),
+            backend=NonFiniteBackend(),
+        )
+    except RuntimeError as exc:
+        assert "Non-finite embedding detected" in str(exc)
+    else:
+        raise AssertionError("Expected run_embed to fail on non-finite embeddings.")
+
+
 def test_embed_requires_anime_prep_table(tmp_path: Path) -> None:
     db_path = tmp_path / "tokenizer.sqlite"
     with sqlite3.connect(db_path):
@@ -207,6 +256,10 @@ def test_cli_embed_phase_smoke_with_patched_backend(tmp_path: Path, monkeypatch)
                 "batch_size = 2",
                 "max_length = 128",
                 'device = "cpu"',
+                'precision = "auto"',
+                f'env_file = "{tmp_path / ".env"}"',
+                'hf_token = ""',
+                'hf_token_env = "HF_TOKEN"',
                 "normalize = true",
             ]
         ),
@@ -258,3 +311,79 @@ def test_resolve_device_rejects_out_of_range_cuda_index() -> None:
         assert "out of range" in str(exc)
     else:
         raise AssertionError("Expected _resolve_device to reject out-of-range CUDA index.")
+
+
+def test_resolve_torch_dtype_auto_prefers_bf16_on_cuda() -> None:
+    fake_torch = FakeTorchPrecision(bf16=True)
+    dtype = _resolve_torch_dtype(device="cuda", precision="auto", torch_module=fake_torch)
+    assert dtype == "bfloat16"
+
+
+def test_resolve_torch_dtype_auto_falls_back_to_fp32_when_bf16_unavailable() -> None:
+    fake_torch = FakeTorchPrecision(bf16=False)
+    dtype = _resolve_torch_dtype(device="cuda", precision="auto", torch_module=fake_torch)
+    assert dtype == "float32"
+
+
+def test_resolve_torch_dtype_rejects_low_precision_on_cpu() -> None:
+    fake_torch = FakeTorchPrecision(bf16=True)
+    try:
+        _resolve_torch_dtype(device="cpu", precision="float16", torch_module=fake_torch)
+    except RuntimeError as exc:
+        assert "requires CUDA device" in str(exc)
+    else:
+        raise AssertionError("Expected _resolve_torch_dtype to reject float16 on CPU.")
+
+
+def test_load_hf_model_prefers_dtype_then_falls_back_to_torch_dtype() -> None:
+    class SupportsDtype:
+        calls: list[dict[str, object]] = []
+
+        @classmethod
+        def from_pretrained(cls, model_name: str, **kwargs: object) -> object:
+            cls.calls.append({"model_name": model_name, **kwargs})
+            if "dtype" not in kwargs:
+                raise AssertionError("Expected dtype argument on first path.")
+            return {"ok": True, "path": "dtype"}
+
+    loaded = _load_hf_model(auto_model_cls=SupportsDtype, model_name="dummy/model", dtype="fp", token="abc")
+    assert loaded == {"ok": True, "path": "dtype"}
+    assert len(SupportsDtype.calls) == 1
+    assert SupportsDtype.calls[0]["token"] == "abc"
+
+    class LegacyTorchDtype:
+        calls: list[dict[str, object]] = []
+
+        @classmethod
+        def from_pretrained(cls, model_name: str, **kwargs: object) -> object:
+            cls.calls.append({"model_name": model_name, **kwargs})
+            if "dtype" in kwargs:
+                raise TypeError("dtype not supported")
+            if "torch_dtype" not in kwargs:
+                raise AssertionError("Expected torch_dtype in fallback path.")
+            return {"ok": True, "path": "torch_dtype"}
+
+    loaded_legacy = _load_hf_model(
+        auto_model_cls=LegacyTorchDtype,
+        model_name="dummy/model",
+        dtype="fp",
+        token="abc",
+    )
+    assert loaded_legacy == {"ok": True, "path": "torch_dtype"}
+    assert len(LegacyTorchDtype.calls) == 2
+    assert LegacyTorchDtype.calls[-1]["token"] == "abc"
+
+
+def test_resolve_hf_token_prefers_direct_then_env_file_then_process_env(tmp_path: Path, monkeypatch) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text("HF_TOKEN=file-token\n", encoding="utf-8")
+    monkeypatch.setenv("HF_TOKEN", "process-token")
+
+    token_direct = _resolve_hf_token(env_file=env_path, direct_token="direct-token", env_key="HF_TOKEN")
+    token_file = _resolve_hf_token(env_file=env_path, direct_token="", env_key="HF_TOKEN")
+    env_path.write_text("", encoding="utf-8")
+    token_process = _resolve_hf_token(env_file=env_path, direct_token="", env_key="HF_TOKEN")
+
+    assert token_direct == "direct-token"
+    assert token_file == "file-token"
+    assert token_process == "process-token"

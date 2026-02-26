@@ -23,6 +23,7 @@ Required sections:
 - `[prep]` for prep-phase settings
 - `[embedd]` for embedding-phase settings (intentionally named `embedd` for extensibility compatibility)
 - `[rqvae]` for RQ-VAE training settings
+- `[tokenize]` for Semantic ID/token vocabulary generation
 
 Example:
 
@@ -36,12 +37,16 @@ limit = 0
 
 [embedd]
 tokenizer_db = "../output/tokenizer.sqlite"
+env_file = "../.env"
 rebuild = true
 limit = 0
 model_name = "tencent/KaLM-Embedding-Gemma3-12B-2511"
 batch_size = 8
 max_length = 2048
 device = "cuda"
+precision = "auto"
+hf_token = ""
+hf_token_env = "HF_TOKEN"
 normalize = true
 
 [rqvae]
@@ -88,6 +93,35 @@ wandb_tags = []
 wandb_project_env = "WANDB_PROJECT"
 wandb_entity_env = "WANDB_ENTITY"
 wandb_api_key_env = "WANDB_API_KEY"
+resume_from = ""
+resume_strict = true
+
+[tokenize]
+tokenizer_db = "../output/tokenizer.sqlite"
+source_db = "../../output/anilist.sqlite"
+rqvae_checkpoint = "../output/rqvae_conservative/rqvae_best.pt"
+out_dir = "../output/tokenize"
+rebuild = true
+limit = 0
+device = "auto"
+batch_size = 512
+write_db_tables = false
+special_tokens = ["<anime_start>", "<anime_end>", "<watch>", "<liked>", "<disliked>", "<dropped>"]
+semantic_id_concat = true
+semantic_id_separator = ""
+cluster_sample_size = 10
+cluster_min_bucket = 20
+cluster_random_seed = 42
+recall_k = 20
+recall_min_support = 10
+recall_positive_score_min = 7
+recall_completed_status = 2
+recall_max_queries = 500
+recall_max_rows = 0
+recall_seed = 42
+dry_run = false
+dry_run_limit = 512
+dry_run_out_subdir = "dry_run"
 ```
 
 ## Phase: `prep`
@@ -128,6 +162,18 @@ uv run animind-tokenizer run \
 - `embedded_at TEXT NOT NULL`
 - `source_prepared_at TEXT`
 
+Precision guidance:
+
+- `embedd.precision = "auto"` uses `bfloat16` on CUDA when available, otherwise `float32`.
+- Avoid `float16` unless explicitly required; it is more likely to produce non-finite embeddings on large models.
+- The loader uses current Transformers API (`dtype=` and `token=`), with compatibility fallback only if needed.
+
+Hugging Face token support:
+
+- Set `embedd.env_file` and define `HF_TOKEN=...` (or `HUGGINGFACE_HUB_TOKEN=...`) in that file.
+- Or set `embedd.hf_token` directly (not recommended for committed configs).
+- `embedd.hf_token_env` lets you choose a custom env variable name.
+
 ## Phase: `rqvae`
 
 `rqvae` trains a shared-codebook Residual-Quantized VAE over `anime_embeddings` and writes checkpoints and metrics.
@@ -154,6 +200,16 @@ Artifacts:
 - `rqvae_config.json`
 - `rqvae_metrics.jsonl`
 - `code_usage.csv`
+
+Resume support:
+
+- Set `resume_from = "last"` (or `"best"` / absolute checkpoint path) to resume training after interruption.
+- Set `resume_strict = true` to fail fast if the checkpoint is missing.
+- `rqvae_last.pt` is always saved at training end, even if `checkpoint_every` does not divide the final epoch.
+
+Evaluation loading:
+
+- Use `load_rqvae_for_eval(checkpoint_path=Path(...), device="cpu|cuda")` from `animind_tokenizer.rqvae` to reconstruct the model and load weights for inference/eval.
 
 ### W&B + `.env`
 
@@ -188,3 +244,38 @@ After a successful `prep` + `embed` run:
 - `anime_prep` contains cleaned anime metadata and `anime_text`.
 - `anime_embeddings` contains one vector per `anime_id`.
 - `anime_text` is single-line, deterministic key-value content per anime record.
+
+## Phase: `tokenize`
+
+`tokenize` loads a trained RQ-VAE checkpoint and converts each anime embedding into a hierarchical Semantic ID.
+
+- Input tables: `anime_prep`, `anime_embeddings`
+- Input checkpoint: `rqvae_best.pt` (or another compatible checkpoint)
+- Output directory: `output/tokenize` (configurable)
+- Builds vocabulary tokens like `<L1_47>`, `<L2_203>`, ...
+- Adds special tokens like `<anime_start>`, `<watch>`, `<liked>`, ...
+- Writes lookup artifacts (`Semantic ID ↔ anime title ↔ anime_id`)
+- Runs validation helpers:
+  - shared-first-token cluster inspection
+  - recall@K evaluation against watch-history proxy similarity from `user_anime`
+  - `recall_max_rows` can cap `user_anime` scan size; dry-run mode automatically caps this for fast checks
+
+Run:
+
+```bash
+uv run animind-tokenizer run \
+  --phase tokenize \
+  --config ./config/tokenizer.toml
+```
+
+Artifacts:
+
+- `semantic_ids.jsonl`
+- `semantic_vocab.json`
+- `special_tokens.json`
+- `semantic_lookup.tsv`
+- `semantic_id_to_anime.jsonl`
+- `cluster_inspection.jsonl`
+- `cluster_summary.json`
+- `recall_report.json`
+- `tokenize_run_summary.json`

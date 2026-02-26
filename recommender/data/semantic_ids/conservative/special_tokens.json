@@ -1,0 +1,10 @@
+{
+  "special_tokens": [
+    "<anime_start>",
+    "<anime_end>",
+    "<watch>",
+    "<liked>",
+    "<disliked>",
+    "<dropped>"
+  ]
+}

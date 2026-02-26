@@ -7,13 +7,17 @@ from typing import Any
 from .embed import EmbedConfig
 from .prep import PrepConfig
 from .rqvae import RQVAEConfig
+from .tokenize import TokenizeConfig
 
 
 def build_prep_config(config_path: Path) -> PrepConfig:
     doc = _load_toml(config_path=config_path)
     section = _require_section(doc=doc, section_name="prep")
 
-    source_db = _resolve_path(config_path=config_path, raw_path=section.get("source_db", "../output/anilist.sqlite"))
+    source_db = _resolve_path(
+        config_path=config_path,
+        raw_path=section.get("source_db", "../output/anilist.sqlite"),
+    )
     out_dir = _resolve_path(config_path=config_path, raw_path=section.get("out_dir", "./output"))
     rebuild = bool(section.get("rebuild", True))
     export_parquet = bool(section.get("export_parquet", True))
@@ -38,6 +42,10 @@ def build_embed_config(config_path: Path) -> EmbedConfig:
         config_path=config_path,
         raw_path=section.get("tokenizer_db", "./output/tokenizer.sqlite"),
     )
+    env_file = _resolve_path(
+        config_path=config_path,
+        raw_path=section.get("env_file", "./.env"),
+    )
     rebuild = bool(section.get("rebuild", True))
     limit = int(section.get("limit", 0))
     if limit < 0:
@@ -45,6 +53,11 @@ def build_embed_config(config_path: Path) -> EmbedConfig:
 
     batch_size = int(section.get("batch_size", 8))
     max_length = int(section.get("max_length", 2048))
+    precision = str(section.get("precision", "auto")).strip().lower()
+    if precision not in {"auto", "float32", "fp32", "float16", "fp16", "bfloat16", "bf16"}:
+        raise RuntimeError(
+            "Invalid embedd.precision in config: must be one of auto, float32, float16, bfloat16"
+        )
     if batch_size < 1:
         raise RuntimeError("Invalid embedd.batch_size in config: must be >= 1")
     if max_length < 8:
@@ -52,12 +65,16 @@ def build_embed_config(config_path: Path) -> EmbedConfig:
 
     return EmbedConfig(
         tokenizer_db=tokenizer_db,
+        env_file=env_file,
         rebuild=rebuild,
         limit=limit,
         model_name=str(section.get("model_name", "tencent/KaLM-Embedding-Gemma3-12B-2511")),
         batch_size=batch_size,
         max_length=max_length,
         device=str(section.get("device", "auto")),
+        precision=precision,
+        hf_token=str(section.get("hf_token", "")),
+        hf_token_env=str(section.get("hf_token_env", "HF_TOKEN")),
         normalize=bool(section.get("normalize", True)),
     )
 
@@ -170,6 +187,12 @@ def build_rqvae_config(config_path: Path) -> RQVAEConfig:
         raise RuntimeError("Invalid rqvae.wandb_tags in config: must be an array of strings")
     wandb_tags = [str(tag) for tag in raw_tags]
 
+    resume_from_raw = str(section.get("resume_from", "")).strip()
+    if resume_from_raw not in {"", "last", "best"}:
+        resume_from = str(_resolve_path(config_path=config_path, raw_path=resume_from_raw))
+    else:
+        resume_from = resume_from_raw
+
     return RQVAEConfig(
         tokenizer_db=tokenizer_db,
         out_dir=out_dir,
@@ -214,6 +237,104 @@ def build_rqvae_config(config_path: Path) -> RQVAEConfig:
         wandb_project_env=str(section.get("wandb_project_env", "WANDB_PROJECT")),
         wandb_entity_env=str(section.get("wandb_entity_env", "WANDB_ENTITY")),
         wandb_api_key_env=str(section.get("wandb_api_key_env", "WANDB_API_KEY")),
+        resume_from=resume_from,
+        resume_strict=bool(section.get("resume_strict", True)),
+    )
+
+
+def build_tokenize_config(config_path: Path) -> TokenizeConfig:
+    doc = _load_toml(config_path=config_path)
+    section = _require_section(doc=doc, section_name="tokenize")
+
+    tokenizer_db = _resolve_path(
+        config_path=config_path,
+        raw_path=section.get("tokenizer_db", "./output/tokenizer.sqlite"),
+    )
+    source_db = _resolve_path(
+        config_path=config_path,
+        raw_path=section.get("source_db", "../output/anilist.sqlite"),
+    )
+    rqvae_checkpoint = _resolve_path(
+        config_path=config_path,
+        raw_path=section.get("rqvae_checkpoint", "./output/rqvae/rqvae_best.pt"),
+    )
+    out_dir = _resolve_path(
+        config_path=config_path,
+        raw_path=section.get("out_dir", "./output/tokenize"),
+    )
+
+    limit = int(section.get("limit", 0))
+    if limit < 0:
+        raise RuntimeError("Invalid tokenize.limit in config: must be >= 0")
+    batch_size = int(section.get("batch_size", 512))
+    if batch_size < 1:
+        raise RuntimeError("Invalid tokenize.batch_size in config: must be >= 1")
+
+    cluster_sample_size = int(section.get("cluster_sample_size", 10))
+    cluster_min_bucket = int(section.get("cluster_min_bucket", 20))
+    if cluster_sample_size < 1:
+        raise RuntimeError("Invalid tokenize.cluster_sample_size in config: must be >= 1")
+    if cluster_min_bucket < 1:
+        raise RuntimeError("Invalid tokenize.cluster_min_bucket in config: must be >= 1")
+
+    recall_k = int(section.get("recall_k", 20))
+    recall_min_support = int(section.get("recall_min_support", 10))
+    recall_positive_score_min = int(section.get("recall_positive_score_min", 7))
+    recall_max_queries = int(section.get("recall_max_queries", 500))
+    recall_max_rows = int(section.get("recall_max_rows", 0))
+    if recall_k < 1:
+        raise RuntimeError("Invalid tokenize.recall_k in config: must be >= 1")
+    if recall_min_support < 1:
+        raise RuntimeError("Invalid tokenize.recall_min_support in config: must be >= 1")
+    if recall_positive_score_min < 0:
+        raise RuntimeError("Invalid tokenize.recall_positive_score_min in config: must be >= 0")
+    if recall_max_queries < 1:
+        raise RuntimeError("Invalid tokenize.recall_max_queries in config: must be >= 1")
+    if recall_max_rows < 0:
+        raise RuntimeError("Invalid tokenize.recall_max_rows in config: must be >= 0")
+
+    raw_tokens = section.get(
+        "special_tokens",
+        ["<anime_start>", "<anime_end>", "<watch>", "<liked>", "<disliked>", "<dropped>"],
+    )
+    if not isinstance(raw_tokens, list):
+        raise RuntimeError("Invalid tokenize.special_tokens in config: must be an array of strings")
+    special_tokens = [str(token) for token in raw_tokens]
+
+    dry_run = bool(section.get("dry_run", False))
+    dry_run_limit = int(section.get("dry_run_limit", 512))
+    dry_run_out_subdir = str(section.get("dry_run_out_subdir", "dry_run")).strip()
+    if dry_run_limit < 2:
+        raise RuntimeError("Invalid tokenize.dry_run_limit in config: must be >= 2")
+    if not dry_run_out_subdir:
+        raise RuntimeError("Invalid tokenize.dry_run_out_subdir in config: must not be empty")
+
+    return TokenizeConfig(
+        tokenizer_db=tokenizer_db,
+        source_db=source_db,
+        rqvae_checkpoint=rqvae_checkpoint,
+        out_dir=out_dir,
+        rebuild=bool(section.get("rebuild", True)),
+        limit=limit,
+        device=str(section.get("device", "auto")),
+        batch_size=batch_size,
+        write_db_tables=bool(section.get("write_db_tables", False)),
+        special_tokens=special_tokens,
+        semantic_id_concat=bool(section.get("semantic_id_concat", True)),
+        semantic_id_separator=str(section.get("semantic_id_separator", "")),
+        cluster_sample_size=cluster_sample_size,
+        cluster_min_bucket=cluster_min_bucket,
+        cluster_random_seed=int(section.get("cluster_random_seed", 42)),
+        recall_k=recall_k,
+        recall_min_support=recall_min_support,
+        recall_positive_score_min=recall_positive_score_min,
+        recall_completed_status=int(section.get("recall_completed_status", 2)),
+        recall_max_queries=recall_max_queries,
+        recall_max_rows=recall_max_rows,
+        recall_seed=int(section.get("recall_seed", 42)),
+        dry_run=dry_run,
+        dry_run_limit=dry_run_limit,
+        dry_run_out_subdir=dry_run_out_subdir,
     )
 
 

@@ -1,0 +1,208 @@
+{
+  "tokenized_at": "2026-02-26T22:05:25+00:00",
+  "row_count": 17562,
+  "rq_levels": 8,
+  "codebook_size": 2048,
+  "checkpoint_path": "/workspace/AniMind/tokenizer/output/rqvae_conservative/rqvae_best.pt",
+  "cluster_summary": {
+    "bucket_min_size": 20,
+    "eligible_bucket_count": 217,
+    "inspected_bucket_count": 20,
+    "global_avg_genre_jaccard": 0.16735694244027577
+  },
+  "recall_summary": {
+    "status": "ok",
+    "recall_k": 20,
+    "completed_status": 2,
+    "score_min": 7,
+    "min_support": 10,
+    "eligible_queries": 500,
+    "evaluated_queries": 500,
+    "mean_recall_at_k": 0.0055000000000000005,
+    "median_recall_at_k": 0.0,
+    "best_examples": [
+      {
+        "anime_id": 471,
+        "recall_at_k": 0.05,
+        "proxy_neighbors": [
+          1720,
+          4166,
+          472,
+          4804,
+          685
+        ],
+        "semantic_neighbors": [
+          5447,
+          729,
+          5521,
+          5674,
+          1583
+        ]
+      },
+      {
+        "anime_id": 5258,
+        "recall_at_k": 0.05,
+        "proxy_neighbors": [
+          263,
+          19647,
+          264,
+          265,
+          12069
+        ],
+        "semantic_neighbors": [
+          815,
+          1538,
+          26449,
+          31812,
+          1476
+        ]
+      },
+      {
+        "anime_id": 2114,
+        "recall_at_k": 0.1,
+        "proxy_neighbors": [
+          2113,
+          5930,
+          3183,
+          19773,
+          4855
+        ],
+        "semantic_neighbors": [
+          41487,
+          3493,
+          3654,
+          5285,
+          7616
+        ]
+      },
+      {
+        "anime_id": 42187,
+        "recall_at_k": 0.1,
+        "proxy_neighbors": [
+          40966,
+          40909,
+          40062,
+          42898,
+          42284
+        ],
+        "semantic_neighbors": [
+          973,
+          41528,
+          15547,
+          259,
+          1041
+        ]
+      },
+      {
+        "anime_id": 4053,
+        "recall_at_k": 0.1,
+        "proxy_neighbors": [
+          2752,
+          995,
+          22,
+          11371,
+          815
+        ],
+        "semantic_neighbors": [
+          1861,
+          43693,
+          2752,
+          1457,
+          13553
+        ]
+      }
+    ],
+    "worst_examples": [
+      {
+        "anime_id": 4463,
+        "recall_at_k": 0.0,
+        "proxy_neighbors": [
+          4488,
+          3066,
+          4697,
+          4496,
+          2990
+        ],
+        "semantic_neighbors": [
+          30600,
+          1864,
+          2781,
+          3912,
+          5902
+        ]
+      },
+      {
+        "anime_id": 28623,
+        "recall_at_k": 0.0,
+        "proxy_neighbors": [
+          31859,
+          28907,
+          31637,
+          26243,
+          28927
+        ],
+        "semantic_neighbors": [
+          30165,
+          41446,
+          1136,
+          3071,
+          33602
+        ]
+      },
+      {
+        "anime_id": 1104,
+        "recall_at_k": 0.0,
+        "proxy_neighbors": [
+          1103,
+          1149,
+          833,
+          1312,
+          2157
+        ],
+        "semantic_neighbors": [
+          1628,
+          1935,
+          522,
+          927,
+          7398
+        ]
+      },
+      {
+        "anime_id": 31798,
+        "recall_at_k": 0.0,
+        "proxy_neighbors": [
+          31478,
+          28623,
+          31859,
+          24439,
+          30015
+        ],
+        "semantic_neighbors": [
+          250,
+          404,
+          1255,
+          1707,
+          2590
+        ]
+      },
+      {
+        "anime_id": 4224,
+        "recall_at_k": 0.0,
+        "proxy_neighbors": [
+          6547,
+          9989,
+          2167,
+          16498,
+          19815
+        ],
+        "semantic_neighbors": [
+          1788,
+          5671,
+          907,
+          1905,
+          2741
+        ]
+      }
+    ]
+  }
+}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from array import array
+import math
 from pathlib import Path
 
 import torch
@@ -9,7 +10,14 @@ from typer.testing import CliRunner
 
 import animind_tokenizer.cli as cli_module
 from animind_tokenizer.cli import app
-from animind_tokenizer.rqvae import RQVAEConfig, _RQVAEModel, run_rqvae
+from animind_tokenizer.rqvae import (
+    RQVAEConfig,
+    _RQVAEModel,
+    _should_update_best,
+    _step_optimizer_and_scheduler,
+    load_rqvae_for_eval,
+    run_rqvae,
+)
 
 
 def _vector_to_blob(vector: list[float]) -> bytes:
@@ -115,6 +123,35 @@ def test_run_rqvae_creates_artifacts(tmp_path: Path) -> None:
     assert len(metrics_lines) == 2
 
 
+def test_run_rqvae_saves_last_at_training_end_even_if_interval_skips(tmp_path: Path) -> None:
+    db_path = tmp_path / "tokenizer.sqlite"
+    out_dir = tmp_path / "rqvae"
+    _create_embedding_db(db_path, rows=24, dim=6)
+
+    run_rqvae(
+        RQVAEConfig(
+            tokenizer_db=db_path,
+            out_dir=out_dir,
+            rebuild=True,
+            device="cpu",
+            batch_size=8,
+            epochs=3,
+            num_workers=0,
+            val_ratio=0.25,
+            warmup_steps=0,
+            latent_dim=8,
+            rq_levels=2,
+            codebook_size=32,
+            encoder_hidden_dim=16,
+            decoder_hidden_dim=16,
+            checkpoint_every=2,
+        )
+    )
+
+    payload = torch.load(out_dir / "rqvae_last.pt", map_location="cpu")
+    assert int(payload["epoch"]) == 3
+
+
 def test_run_rqvae_dry_run_creates_subdir_artifacts(tmp_path: Path) -> None:
     db_path = tmp_path / "tokenizer.sqlite"
     out_dir = tmp_path / "rqvae"
@@ -156,9 +193,10 @@ def test_run_rqvae_dry_run_creates_subdir_artifacts(tmp_path: Path) -> None:
     assert len(metrics_lines) == 1
 
 
-def test_run_rqvae_wandb_enabled_without_package_fails(tmp_path: Path) -> None:
+def test_run_rqvae_wandb_enabled_without_project_fails(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "tokenizer.sqlite"
     _create_embedding_db(db_path, rows=12, dim=6)
+    monkeypatch.delenv("WANDB_PROJECT", raising=False)
 
     try:
         run_rqvae(
@@ -179,13 +217,237 @@ def test_run_rqvae_wandb_enabled_without_package_fails(tmp_path: Path) -> None:
                 decoder_hidden_dim=16,
                 wandb_enabled=True,
                 wandb_mode="offline",
-                wandb_project="animind-tokenizer",
+                wandb_project="",
+                env_file=tmp_path / "missing.env",
             )
         )
     except RuntimeError as exc:
-        assert "package is not installed" in str(exc)
+        assert "project is missing" in str(exc)
     else:
-        raise AssertionError("Expected run_rqvae to fail when wandb is enabled but not installed.")
+        raise AssertionError("Expected run_rqvae to fail when wandb is enabled but project is unset.")
+
+
+def test_should_update_best_handles_non_finite_values() -> None:
+    assert _should_update_best(epoch=1, current_val=float("nan"), best_val=math.inf) is True
+    assert _should_update_best(epoch=2, current_val=float("nan"), best_val=1.0) is False
+    assert _should_update_best(epoch=2, current_val=0.5, best_val=float("nan")) is True
+    assert _should_update_best(epoch=2, current_val=1.5, best_val=1.0) is False
+
+
+def test_step_optimizer_and_scheduler_skips_scheduler_when_scale_drops() -> None:
+    class FakeOptimizer:
+        def __init__(self) -> None:
+            self.steps = 0
+
+        def step(self) -> None:
+            self.steps += 1
+
+    class FakeScheduler:
+        def __init__(self) -> None:
+            self.steps = 0
+
+        def step(self) -> None:
+            self.steps += 1
+
+    class FakeScaler:
+        def __init__(self, before: float, after: float) -> None:
+            self.scale = before
+            self.after = after
+
+        def get_scale(self) -> float:
+            return self.scale
+
+        def step(self, optimizer: FakeOptimizer) -> None:
+            optimizer.step()
+
+        def update(self) -> None:
+            self.scale = self.after
+
+    optimizer = FakeOptimizer()
+    scheduler = FakeScheduler()
+    scaler = FakeScaler(before=8.0, after=4.0)
+    stepped = _step_optimizer_and_scheduler(
+        optimizer=optimizer,  # type: ignore[arg-type]
+        scheduler=scheduler,  # type: ignore[arg-type]
+        scaler=scaler,  # type: ignore[arg-type]
+    )
+
+    assert stepped is False
+    assert optimizer.steps == 1
+    assert scheduler.steps == 0
+
+
+def test_step_optimizer_and_scheduler_steps_scheduler_when_scale_holds() -> None:
+    class FakeOptimizer:
+        def __init__(self) -> None:
+            self.steps = 0
+
+        def step(self) -> None:
+            self.steps += 1
+
+    class FakeScheduler:
+        def __init__(self) -> None:
+            self.steps = 0
+
+        def step(self) -> None:
+            self.steps += 1
+
+    class FakeScaler:
+        def __init__(self, before: float, after: float) -> None:
+            self.scale = before
+            self.after = after
+
+        def get_scale(self) -> float:
+            return self.scale
+
+        def step(self, optimizer: FakeOptimizer) -> None:
+            optimizer.step()
+
+        def update(self) -> None:
+            self.scale = self.after
+
+    optimizer = FakeOptimizer()
+    scheduler = FakeScheduler()
+    scaler = FakeScaler(before=8.0, after=8.0)
+    stepped = _step_optimizer_and_scheduler(
+        optimizer=optimizer,  # type: ignore[arg-type]
+        scheduler=scheduler,  # type: ignore[arg-type]
+        scaler=scaler,  # type: ignore[arg-type]
+    )
+
+    assert stepped is True
+    assert optimizer.steps == 1
+    assert scheduler.steps == 1
+
+
+def test_run_rqvae_resume_from_last_checkpoint(tmp_path: Path) -> None:
+    db_path = tmp_path / "tokenizer.sqlite"
+    out_dir = tmp_path / "rqvae"
+    _create_embedding_db(db_path, rows=24, dim=6)
+
+    run_rqvae(
+        RQVAEConfig(
+            tokenizer_db=db_path,
+            out_dir=out_dir,
+            rebuild=True,
+            device="cpu",
+            batch_size=8,
+            epochs=1,
+            num_workers=0,
+            val_ratio=0.25,
+            warmup_steps=0,
+            latent_dim=8,
+            rq_levels=2,
+            codebook_size=32,
+            encoder_hidden_dim=16,
+            decoder_hidden_dim=16,
+            checkpoint_every=1,
+        )
+    )
+
+    run_rqvae(
+        RQVAEConfig(
+            tokenizer_db=db_path,
+            out_dir=out_dir,
+            rebuild=False,
+            resume_from="last",
+            device="cpu",
+            batch_size=8,
+            epochs=2,
+            num_workers=0,
+            val_ratio=0.25,
+            warmup_steps=0,
+            latent_dim=8,
+            rq_levels=2,
+            codebook_size=32,
+            encoder_hidden_dim=16,
+            decoder_hidden_dim=16,
+            checkpoint_every=1,
+        )
+    )
+
+    payload = torch.load(out_dir / "rqvae_last.pt", map_location="cpu")
+    assert int(payload["epoch"]) == 2
+    metrics_lines = (out_dir / "rqvae_metrics.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(metrics_lines) == 2
+
+
+def test_load_rqvae_for_eval_from_best_checkpoint(tmp_path: Path) -> None:
+    db_path = tmp_path / "tokenizer.sqlite"
+    out_dir = tmp_path / "rqvae"
+    _create_embedding_db(db_path, rows=24, dim=6)
+
+    run_rqvae(
+        RQVAEConfig(
+            tokenizer_db=db_path,
+            out_dir=out_dir,
+            rebuild=True,
+            device="cpu",
+            batch_size=8,
+            epochs=1,
+            num_workers=0,
+            val_ratio=0.25,
+            warmup_steps=0,
+            latent_dim=8,
+            rq_levels=2,
+            codebook_size=32,
+            encoder_hidden_dim=16,
+            decoder_hidden_dim=16,
+            checkpoint_every=1,
+        )
+    )
+
+    model, checkpoint = load_rqvae_for_eval(
+        checkpoint_path=out_dir / "rqvae_best.pt",
+        device="cpu",
+    )
+    assert model.training is False
+    assert int(checkpoint["epoch"]) == 1
+    with torch.no_grad():
+        out = model(torch.randn(3, 6))
+    assert "loss" in out
+    assert out["codes"].shape == (3, 2)
+
+
+def test_run_rqvae_rejects_non_finite_embeddings(tmp_path: Path) -> None:
+    db_path = tmp_path / "tokenizer.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE anime_embeddings (
+                anime_id INTEGER PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                embedding_dim INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO anime_embeddings(anime_id, embedding, embedding_dim) VALUES (?, ?, ?)",
+            (1, sqlite3.Binary(_vector_to_blob([math.nan, 0.1, 0.2])), 3),
+        )
+        conn.commit()
+
+    try:
+        run_rqvae(
+            RQVAEConfig(
+                tokenizer_db=db_path,
+                out_dir=tmp_path / "rqvae",
+                rebuild=True,
+                device="cpu",
+                batch_size=2,
+                epochs=1,
+                num_workers=0,
+                latent_dim=8,
+                rq_levels=2,
+                codebook_size=32,
+                encoder_hidden_dim=8,
+                decoder_hidden_dim=8,
+            )
+        )
+    except RuntimeError as exc:
+        assert "contains non-finite values" in str(exc)
+    else:
+        raise AssertionError("Expected run_rqvae to fail on non-finite embeddings.")
 
 
 def test_run_rqvae_rejects_inconsistent_embedding_dim(tmp_path: Path) -> None:

@@ -7,7 +7,7 @@ import os
 import sqlite3
 from array import array
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +78,8 @@ class RQVAEConfig:
     wandb_project_env: str = "WANDB_PROJECT"
     wandb_entity_env: str = "WANDB_ENTITY"
     wandb_api_key_env: str = "WANDB_API_KEY"
+    resume_from: str = ""
+    resume_strict: bool = True
 
 
 class _EncoderMLP(nn.Module):
@@ -248,8 +250,9 @@ def run_rqvae(config: RQVAEConfig) -> None:
             f"{_cuda_unavailable_reason(torch_module=torch)}"
         )
 
+    resume_requested = bool(effective_config.resume_from.strip())
     effective_config.out_dir.mkdir(parents=True, exist_ok=True)
-    _reset_output_artifacts(config=effective_config)
+    _reset_output_artifacts(config=effective_config, allow_existing=resume_requested)
 
     stage_columns = (
         SpinnerColumn(),
@@ -328,12 +331,29 @@ def run_rqvae(config: RQVAEConfig) -> None:
         metrics_path = effective_config.out_dir / "rqvae_metrics.jsonl"
         usage_path = effective_config.out_dir / "code_usage.csv"
         _write_json(effective_config.out_dir / "rqvae_config.json", metadata)
-        _write_usage_header(path=usage_path)
+        if not (resume_requested and usage_path.exists()):
+            _write_usage_header(path=usage_path)
         wandb_run = _init_wandb(config=effective_config, metadata=metadata, console=console)
         stage_progress.advance(stage_task)
 
         stage_progress.update(stage_task, description="[cyan]6/7 Train model[/cyan]")
+        start_epoch = 1
         best_val_loss = math.inf
+        if resume_requested:
+            start_epoch, best_val_loss = _resume_training_state(
+                config=effective_config,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                map_device=resolved_device,
+                console=console,
+            )
+            if start_epoch > effective_config.epochs:
+                console.log(
+                    "[yellow]Resume checkpoint epoch is already at/above target epochs; "
+                    "skipping train loop.[/yellow]"
+                )
+
         epoch_columns = (
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -343,8 +363,9 @@ def run_rqvae(config: RQVAEConfig) -> None:
             TimeElapsedColumn(),
             TimeRemainingColumn(),
         )
+        last_checkpoint_payload: dict[str, Any] | None = None
         try:
-            for epoch in range(1, effective_config.epochs + 1):
+            for epoch in range(start_epoch, effective_config.epochs + 1):
                 model.train()
                 with Progress(*epoch_columns, console=console) as progress:
                     train_task = progress.add_task(
@@ -413,6 +434,7 @@ def run_rqvae(config: RQVAEConfig) -> None:
                     "config": metadata,
                     "metrics": metric_record,
                 }
+                last_checkpoint_payload = checkpoint_payload
                 if epoch % effective_config.checkpoint_every == 0:
                     _save_checkpoint(
                         path=effective_config.out_dir / "rqvae_last.pt",
@@ -420,8 +442,12 @@ def run_rqvae(config: RQVAEConfig) -> None:
                         console=console,
                         label="last",
                     )
-                if val_metrics["loss"] < best_val_loss:
-                    best_val_loss = val_metrics["loss"]
+                if _should_update_best(
+                    epoch=epoch,
+                    current_val=float(val_metrics["loss"]),
+                    best_val=float(best_val_loss),
+                ):
+                    best_val_loss = float(val_metrics["loss"])
                     _save_checkpoint(
                         path=effective_config.out_dir / "rqvae_best.pt",
                         payload=checkpoint_payload,
@@ -441,6 +467,22 @@ def run_rqvae(config: RQVAEConfig) -> None:
                     f"perplexity={perplexity:.2f}, "
                     f"best_updated={best_flag}."
                 )
+            if last_checkpoint_payload is not None:
+                _save_checkpoint(
+                    path=effective_config.out_dir / "rqvae_last.pt",
+                    payload=last_checkpoint_payload,
+                    console=console,
+                    label="last-final",
+                )
+        except Exception:
+            if last_checkpoint_payload is not None:
+                _save_checkpoint(
+                    path=effective_config.out_dir / "rqvae_last.pt",
+                    payload=last_checkpoint_payload,
+                    console=console,
+                    label="last-recovery",
+                )
+            raise
         finally:
             _finish_wandb(wandb_run=wandb_run)
         stage_progress.advance(stage_task)
@@ -628,6 +670,117 @@ def _validate_dry_run_artifacts(*, out_dir: Path, expected_epochs: int) -> None:
         raise RuntimeError("Dry-run validation failed; best checkpoint payload is incomplete.")
 
 
+def _should_update_best(*, epoch: int, current_val: float, best_val: float) -> bool:
+    if epoch == 1:
+        return True
+    if not math.isfinite(current_val):
+        return False
+    if not math.isfinite(best_val):
+        return True
+    return current_val < best_val
+
+
+def _resolve_resume_checkpoint_path(config: RQVAEConfig) -> Path | None:
+    raw = config.resume_from.strip()
+    if not raw:
+        return None
+    if raw == "last":
+        return config.out_dir / "rqvae_last.pt"
+    if raw == "best":
+        return config.out_dir / "rqvae_best.pt"
+    return Path(raw)
+
+
+def _resume_training_state(
+    *,
+    config: RQVAEConfig,
+    model: _RQVAEModel,
+    optimizer: Adam,
+    scheduler: LambdaLR | None,
+    map_device: str,
+    console: Console,
+) -> tuple[int, float]:
+    checkpoint_path = _resolve_resume_checkpoint_path(config=config)
+    if checkpoint_path is None:
+        return 1, math.inf
+    if not checkpoint_path.exists():
+        if config.resume_strict:
+            raise RuntimeError(f"Resume checkpoint not found: {checkpoint_path}")
+        console.log(
+            f"[yellow]Resume checkpoint not found; continuing fresh run:[/yellow] {checkpoint_path}"
+        )
+        return 1, math.inf
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if "model_state_dict" not in checkpoint:
+        raise RuntimeError(f"Invalid resume checkpoint (missing model_state_dict): {checkpoint_path}")
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    optimizer_state = checkpoint.get("optimizer_state_dict")
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+        for state in optimizer.state.values():
+            for key, value in state.items():
+                if isinstance(value, torch.Tensor):
+                    state[key] = value.to(map_device)
+
+    if scheduler is not None:
+        scheduler_state = checkpoint.get("scheduler_state_dict")
+        if scheduler_state is not None:
+            scheduler.load_state_dict(scheduler_state)
+
+    checkpoint_epoch = int(checkpoint.get("epoch", 0))
+    metrics = checkpoint.get("metrics")
+    best_val = math.inf
+    if isinstance(metrics, dict):
+        candidate_val = float(metrics.get("val_total", math.inf))
+        if math.isfinite(candidate_val):
+            best_val = candidate_val
+
+    start_epoch = checkpoint_epoch + 1
+    console.log(
+        "[green]Resumed from checkpoint.[/green] "
+        f"path={checkpoint_path}, checkpoint_epoch={checkpoint_epoch}, next_epoch={start_epoch}."
+    )
+    return start_epoch, best_val
+
+
+def load_rqvae_for_eval(*, checkpoint_path: Path, device: str = "cpu") -> tuple[_RQVAEModel, dict[str, Any]]:
+    if not checkpoint_path.exists():
+        raise RuntimeError(f"Checkpoint not found: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    metadata = checkpoint.get("config")
+    if not isinstance(metadata, dict):
+        raise RuntimeError("Checkpoint is missing config metadata for model reconstruction.")
+    if "input_dim" not in metadata:
+        raise RuntimeError("Checkpoint config is missing input_dim.")
+
+    restored_config = _restore_rqvae_config(metadata=metadata)
+    input_dim = int(metadata["input_dim"])
+    model = _RQVAEModel(input_dim=input_dim, config=restored_config)
+    if "model_state_dict" not in checkpoint:
+        raise RuntimeError("Checkpoint is missing model_state_dict.")
+    model.load_state_dict(checkpoint["model_state_dict"])
+    resolved_device = _resolve_device(device=device, torch_module=torch)
+    model.to(resolved_device)
+    model.eval()
+    return model, checkpoint
+
+
+def _restore_rqvae_config(*, metadata: dict[str, Any]) -> RQVAEConfig:
+    valid = {f.name for f in fields(RQVAEConfig)}
+    kwargs: dict[str, Any] = {}
+    for name in valid:
+        if name in metadata:
+            kwargs[name] = metadata[name]
+    for path_field in ("tokenizer_db", "out_dir", "env_file"):
+        if path_field in kwargs:
+            kwargs[path_field] = Path(str(kwargs[path_field]))
+    if "wandb_tags" in kwargs and kwargs["wandb_tags"] is None:
+        kwargs["wandb_tags"] = []
+    return RQVAEConfig(**kwargs)
+
+
 def _run_epoch(
     *,
     model: _RQVAEModel,
@@ -650,7 +803,7 @@ def _run_epoch(
     total_commit = 0.0
     usage_counts = torch.zeros(model.quantizer.codebook_size, dtype=torch.float32)
 
-    for (batch_x,) in dataloader:
+    for batch_idx, (batch_x,) in enumerate(dataloader, start=1):
         batch_x = batch_x.to(device, non_blocking=True)
         batch_size = int(batch_x.size(0))
         sample_count += batch_size
@@ -666,16 +819,27 @@ def _run_epoch(
             outputs = model(batch_x)
             loss = outputs["loss"]
 
+        loss_value = float(outputs["loss"].detach().item())
+        recon_value = float(outputs["recon_loss"].detach().item())
+        commit_value = float(outputs["commitment_loss"].detach().item())
+        if not (math.isfinite(loss_value) and math.isfinite(recon_value) and math.isfinite(commit_value)):
+            raise RuntimeError(
+                "Non-finite loss detected during RQ-VAE training. "
+                f"batch={batch_idx}, loss={loss_value}, recon={recon_value}, commit={commit_value}. "
+                "Check embedding integrity and numeric stability settings."
+            )
+
         if optimizer is not None and scaler is not None:
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            if scheduler is not None:
-                scheduler.step()
+            _step_optimizer_and_scheduler(
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+            )
 
-        total_loss += float(outputs["loss"].detach().item()) * batch_size
-        total_recon += float(outputs["recon_loss"].detach().item()) * batch_size
-        total_commit += float(outputs["commitment_loss"].detach().item()) * batch_size
+        total_loss += loss_value * batch_size
+        total_recon += recon_value * batch_size
+        total_commit += commit_value * batch_size
         usage_counts += outputs["usage_counts"].detach().cpu().to(torch.float32)
         progress.advance(task_id, advance=1)
 
@@ -717,6 +881,23 @@ def _build_dataloaders(
     return train_loader, val_loader
 
 
+def _step_optimizer_and_scheduler(
+    *,
+    optimizer: Adam,
+    scheduler: LambdaLR | None,
+    scaler: torch.amp.GradScaler,
+) -> bool:
+    scale_before = float(scaler.get_scale())
+    scaler.step(optimizer)
+    scaler.update()
+    scale_after = float(scaler.get_scale())
+
+    optimizer_stepped = scale_after >= scale_before
+    if scheduler is not None and optimizer_stepped:
+        scheduler.step()
+    return optimizer_stepped
+
+
 def _build_scheduler(*, optimizer: Adam, warmup_steps: int) -> LambdaLR | None:
     if warmup_steps <= 0:
         return None
@@ -733,19 +914,20 @@ def _load_embeddings(config: RQVAEConfig) -> torch.Tensor:
     if not config.tokenizer_db.exists():
         raise RuntimeError(f"Tokenizer DB not found: {config.tokenizer_db}")
 
-    query = "SELECT embedding, embedding_dim FROM anime_embeddings ORDER BY anime_id"
+    query = "SELECT anime_id, embedding, embedding_dim FROM anime_embeddings ORDER BY anime_id"
     if config.limit > 0:
         query += f" LIMIT {int(config.limit)}"
 
     vectors: list[torch.Tensor] = []
     expected_dim: int | None = None
+    non_finite_ids: list[int] = []
     with sqlite3.connect(config.tokenizer_db) as conn:
         conn.execute("PRAGMA busy_timeout = 8000;")
         if not _table_exists(conn, "anime_embeddings"):
             raise RuntimeError("Missing anime_embeddings table. Run --phase embed before --phase rqvae.")
 
         cursor = conn.execute(query)
-        for blob, embedding_dim in cursor:
+        for anime_id, blob, embedding_dim in cursor:
             if expected_dim is None:
                 expected_dim = int(embedding_dim)
             elif int(embedding_dim) != expected_dim:
@@ -757,8 +939,20 @@ def _load_embeddings(config: RQVAEConfig) -> torch.Tensor:
                 raise RuntimeError(
                     "Embedding blob length does not match embedding_dim metadata."
                 )
+            if not bool(torch.isfinite(vector).all()):
+                non_finite_ids.append(int(anime_id))
+                if len(non_finite_ids) >= 20:
+                    break
+                continue
             vectors.append(vector)
 
+    if non_finite_ids:
+        preview = ", ".join(str(item) for item in non_finite_ids[:10])
+        raise RuntimeError(
+            "anime_embeddings contains non-finite values (NaN/Inf), so RQ-VAE training cannot proceed. "
+            f"example_anime_ids=[{preview}]. "
+            "Re-run --phase embed after enabling stable precision and verifying finite embeddings."
+        )
     if not vectors:
         raise RuntimeError("No embeddings found in anime_embeddings; nothing to train.")
 
@@ -866,7 +1060,7 @@ def _append_usage_row(
         writer.writerow([epoch, used_codes, total_codes, f"{usage_pct:.6f}", f"{perplexity:.6f}"])
 
 
-def _reset_output_artifacts(config: RQVAEConfig) -> None:
+def _reset_output_artifacts(config: RQVAEConfig, *, allow_existing: bool = False) -> None:
     managed_files = (
         config.out_dir / "rqvae_best.pt",
         config.out_dir / "rqvae_last.pt",
@@ -877,11 +1071,16 @@ def _reset_output_artifacts(config: RQVAEConfig) -> None:
     if not config.rebuild:
         existing = [path for path in managed_files if path.exists()]
         if existing:
+            if allow_existing:
+                return
             joined = ", ".join(str(path) for path in existing)
             raise RuntimeError(
                 "RQ-VAE output artifacts already exist and rebuild=false. "
                 f"Set rebuild=true or clean these files: {joined}"
             )
+        return
+
+    if allow_existing:
         return
 
     for path in managed_files:

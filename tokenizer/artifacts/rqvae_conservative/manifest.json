@@ -1,0 +1,7 @@
+{
+  "file": "artifacts/rqvae_conservative/rqvae_best_infer.pt",
+  "sha256": "8b384afcaf7230f954d066414eea778982d28e255cc8ecd3d0da0247dc7cf3c3",
+  "size_bytes": 37788123,
+  "source_checkpoint": "output/rqvae_conservative/rqvae_best.pt",
+  "notes": "Inference-only payload with model_state_dict + config + metrics; optimizer/scheduler removed for GitHub size compatibility."
+}

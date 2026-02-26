@@ -219,3 +219,4 @@ __marimo__/
 /output/
 /dataset_builder/output/
 /tokenizer/output/
+/tokenizer/wandb/

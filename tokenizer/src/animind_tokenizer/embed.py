@@ -5,6 +5,7 @@ import sqlite3
 from array import array
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import math
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -36,6 +37,10 @@ class EmbedConfig:
     batch_size: int = 8
     max_length: int = 2048
     device: str = "auto"
+    precision: str = "auto"
+    env_file: Path = Path("./.env")
+    hf_token: str = ""
+    hf_token_env: str = "HF_TOKEN"
     normalize: bool = True
 
 
@@ -47,6 +52,10 @@ class HuggingFaceEmbeddingBackend:
         batch_size: int,
         max_length: int,
         device: str,
+        precision: str,
+        env_file: Path,
+        hf_token: str,
+        hf_token_env: str,
         normalize: bool,
         console: Console | None = None,
     ) -> None:
@@ -65,8 +74,21 @@ class HuggingFaceEmbeddingBackend:
         self.max_length = max_length
         self.normalize = normalize
         self.requested_device = device.strip().lower()
+        self.requested_precision = precision.strip().lower()
+        self.env_file = env_file
+        self.hf_token_env = hf_token_env.strip() or "HF_TOKEN"
+        self.hf_token = _resolve_hf_token(
+            env_file=self.env_file,
+            direct_token=hf_token,
+            env_key=self.hf_token_env,
+        )
+        self.hf_token_set = bool(self.hf_token)
         self.device = _resolve_device(device=device, torch_module=torch)
-        self.dtype = torch.float16 if self.device.startswith("cuda") else torch.float32
+        self.dtype = _resolve_torch_dtype(
+            device=self.device,
+            precision=self.requested_precision,
+            torch_module=torch,
+        )
         self.model_retrieved = False
         self.model_loaded = False
         self.gpu_name: str | None = None
@@ -75,7 +97,9 @@ class HuggingFaceEmbeddingBackend:
         self.console.log(
             "Embedding backend setup: "
             f"model={self.model_name}, requested_device={self.requested_device}, "
-            f"resolved_device={self.device}, dtype={str(self.dtype).replace('torch.', '')}."
+            f"resolved_device={self.device}, requested_precision={self.requested_precision}, "
+            f"dtype={str(self.dtype).replace('torch.', '')}, "
+            f"hf_token={'set' if self.hf_token_set else 'unset'}."
         )
         if self.requested_device == "auto" and self.device == "cpu":
             self.console.log(
@@ -84,14 +108,19 @@ class HuggingFaceEmbeddingBackend:
             )
 
         with self.console.status("[cyan]Retrieving tokenizer (hub/cache)...", spinner="dots"):
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name,
+                trust_remote_code=True,
+                token=(self.hf_token or None),
+            )
         self.console.log("[green]Tokenizer ready.[/green]")
 
         with self.console.status("[cyan]Retrieving model weights (hub/cache)...", spinner="dots"):
-            self.model = AutoModel.from_pretrained(
-                self.model_name,
-                trust_remote_code=True,
-                torch_dtype=self.dtype,
+            self.model = _load_hf_model(
+                auto_model_cls=AutoModel,
+                model_name=self.model_name,
+                dtype=self.dtype,
+                token=(self.hf_token or None),
             )
             self.model_retrieved = True
         self.console.log("[green]Model weights retrieved.[/green]")
@@ -130,6 +159,14 @@ class HuggingFaceEmbeddingBackend:
             embeddings = _extract_embeddings(outputs=outputs, attention_mask=encoded.get("attention_mask"), torch_module=torch)
             if self.normalize:
                 embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+            finite_mask = torch.isfinite(embeddings)
+            if not bool(finite_mask.all()):
+                bad_values = int((~finite_mask).sum().item())
+                raise RuntimeError(
+                    "Embedding backend produced non-finite values. "
+                    f"bad_values={bad_values}, device={self.device}, dtype={str(self.dtype).replace('torch.', '')}. "
+                    "This often indicates an unstable model precision/runtime configuration."
+                )
             return embeddings.detach().cpu().float().tolist()
 
     def runtime_summary(self) -> str:
@@ -197,6 +234,10 @@ def run_embed(config: EmbedConfig, backend: EmbeddingBackend | None = None) -> N
             batch_size=config.batch_size,
             max_length=config.max_length,
             device=config.device,
+            precision=config.precision,
+            env_file=config.env_file,
+            hf_token=config.hf_token,
+            hf_token_env=config.hf_token_env,
             normalize=config.normalize,
             console=console,
         )
@@ -238,6 +279,11 @@ def run_embed(config: EmbedConfig, backend: EmbeddingBackend | None = None) -> N
 
                 values: list[tuple[Any, ...]] = []
                 for row, vector in zip(batch, vectors, strict=True):
+                    if _vector_has_non_finite(vector):
+                        raise RuntimeError(
+                            "Non-finite embedding detected; aborting write to prevent corrupt training data. "
+                            f"anime_id={int(row[0])}, model={config.model_name}."
+                        )
                     if embedding_dim is None:
                         embedding_dim = len(vector)
                     elif len(vector) != embedding_dim:
@@ -453,3 +499,106 @@ def blob_to_vector(blob: bytes) -> list[float]:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _vector_has_non_finite(vector: list[float]) -> bool:
+    return any(not math.isfinite(float(value)) for value in vector)
+
+
+def _resolve_torch_dtype(device: str, precision: str, torch_module: Any) -> Any:
+    normalized = precision.strip().lower()
+    aliases = {
+        "auto": "auto",
+        "fp32": "float32",
+        "float32": "float32",
+        "fp16": "float16",
+        "float16": "float16",
+        "bf16": "bfloat16",
+        "bfloat16": "bfloat16",
+    }
+    if normalized not in aliases:
+        raise RuntimeError(
+            "Unsupported embedd.precision value. "
+            "Expected one of: auto, float32, float16, bfloat16."
+        )
+    mode = aliases[normalized]
+
+    if not device.startswith("cuda"):
+        if mode in {"float16", "bfloat16"}:
+            raise RuntimeError(
+                "embedd.precision=float16/bfloat16 requires CUDA device. "
+                f"Resolved device is {device}."
+            )
+        return torch_module.float32
+
+    if mode == "float32":
+        return torch_module.float32
+    if mode == "float16":
+        return torch_module.float16
+    if mode == "bfloat16":
+        try:
+            if hasattr(torch_module.cuda, "is_bf16_supported") and bool(torch_module.cuda.is_bf16_supported()):
+                return torch_module.bfloat16
+        except Exception:
+            pass
+        raise RuntimeError(
+            "embedd.precision=bfloat16 requested but CUDA BF16 is not supported on this GPU/runtime."
+        )
+
+    try:
+        if hasattr(torch_module.cuda, "is_bf16_supported") and bool(torch_module.cuda.is_bf16_supported()):
+            return torch_module.bfloat16
+    except Exception:
+        pass
+    return torch_module.float32
+
+
+def _load_hf_model(*, auto_model_cls: Any, model_name: str, dtype: Any, token: str | None) -> Any:
+    try:
+        return auto_model_cls.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            dtype=dtype,
+            token=token,
+        )
+    except TypeError:
+        return auto_model_cls.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            torch_dtype=dtype,
+            token=token,
+        )
+
+
+def _load_dotenv(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip("'").strip('"')
+    return values
+
+
+def _resolve_hf_token(*, env_file: Path, direct_token: str, env_key: str) -> str:
+    if direct_token.strip():
+        return direct_token.strip()
+
+    dotenv_values = _load_dotenv(env_file)
+    token = dotenv_values.get(env_key, "").strip()
+    if token:
+        return token
+
+    env_token = os.environ.get(env_key, "").strip()
+    if env_token:
+        return env_token
+
+    # Common Hugging Face default env names.
+    for fallback in ("HUGGINGFACE_HUB_TOKEN", "HF_TOKEN"):
+        candidate = dotenv_values.get(fallback, "").strip() or os.environ.get(fallback, "").strip()
+        if candidate:
+            return candidate
+    return ""
