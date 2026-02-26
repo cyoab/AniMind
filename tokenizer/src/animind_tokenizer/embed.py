@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from array import array
 from dataclasses import dataclass
@@ -8,6 +9,15 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 
 DEFAULT_EMBED_MODEL = "tencent/KaLM-Embedding-Gemma3-12B-2511"
 
@@ -38,6 +48,7 @@ class HuggingFaceEmbeddingBackend:
         max_length: int,
         device: str,
         normalize: bool,
+        console: Console | None = None,
     ) -> None:
         try:
             import torch
@@ -48,21 +59,60 @@ class HuggingFaceEmbeddingBackend:
             ) from exc
 
         self._torch = torch
+        self.console = console or Console()
         self.model_name = model_name
         self.batch_size = batch_size
         self.max_length = max_length
         self.normalize = normalize
+        self.requested_device = device.strip().lower()
         self.device = _resolve_device(device=device, torch_module=torch)
-        dtype = torch.float16 if self.device.startswith("cuda") else torch.float32
+        self.dtype = torch.float16 if self.device.startswith("cuda") else torch.float32
+        self.model_retrieved = False
+        self.model_loaded = False
+        self.gpu_name: str | None = None
+        self.gpu_total_memory_gib: float | None = None
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
-        self.model = AutoModel.from_pretrained(
-            self.model_name,
-            trust_remote_code=True,
-            torch_dtype=dtype,
+        self.console.log(
+            "Embedding backend setup: "
+            f"model={self.model_name}, requested_device={self.requested_device}, "
+            f"resolved_device={self.device}, dtype={str(self.dtype).replace('torch.', '')}."
         )
-        self.model.to(self.device)
-        self.model.eval()
+        if self.requested_device == "auto" and self.device == "cpu":
+            self.console.log(
+                "[yellow]CUDA unavailable; falling back to CPU.[/yellow] "
+                f"{_cuda_unavailable_reason(torch_module=torch)}"
+            )
+
+        with self.console.status("[cyan]Retrieving tokenizer (hub/cache)...", spinner="dots"):
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
+        self.console.log("[green]Tokenizer ready.[/green]")
+
+        with self.console.status("[cyan]Retrieving model weights (hub/cache)...", spinner="dots"):
+            self.model = AutoModel.from_pretrained(
+                self.model_name,
+                trust_remote_code=True,
+                torch_dtype=self.dtype,
+            )
+            self.model_retrieved = True
+        self.console.log("[green]Model weights retrieved.[/green]")
+
+        with self.console.status(
+            f"[cyan]Loading model onto {self.device} and verifying runtime...[/cyan]",
+            spinner="dots",
+        ):
+            self.model.to(self.device)
+            self.model.eval()
+            self._verify_runtime()
+            self.model_loaded = True
+        self.console.log(
+            "[green]Model loaded and verified.[/green] "
+            f"device={self.device}"
+            + (
+                f", gpu={self.gpu_name}, vram={self.gpu_total_memory_gib:.2f} GiB."
+                if self.gpu_name and self.gpu_total_memory_gib is not None
+                else "."
+            )
+        )
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         torch = self._torch
@@ -81,6 +131,40 @@ class HuggingFaceEmbeddingBackend:
             if self.normalize:
                 embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
             return embeddings.detach().cpu().float().tolist()
+
+    def runtime_summary(self) -> str:
+        summary = (
+            f"model={self.model_name}, device={self.device}, "
+            f"dtype={str(self.dtype).replace('torch.', '')}, "
+            f"retrieved={self.model_retrieved}, loaded={self.model_loaded}"
+        )
+        if self.gpu_name and self.gpu_total_memory_gib is not None:
+            summary += f", gpu={self.gpu_name}, vram={self.gpu_total_memory_gib:.2f} GiB"
+        return summary
+
+    def _verify_runtime(self) -> None:
+        if not self.device.startswith("cuda"):
+            return
+
+        try:
+            target_device = self._torch.device(self.device)
+            cuda_index = (
+                int(target_device.index)
+                if target_device.index is not None
+                else int(self._torch.cuda.current_device())
+            )
+            props = self._torch.cuda.get_device_properties(cuda_index)
+            self.gpu_name = props.name
+            self.gpu_total_memory_gib = props.total_memory / (1024**3)
+
+            probe = self._torch.randn((256, 256), device=self.device, dtype=self.dtype)
+            _ = (probe @ probe.T).sum().item()
+            self._torch.cuda.synchronize()
+        except Exception as exc:  # pragma: no cover - depends on runtime CUDA availability.
+            raise RuntimeError(
+                "CUDA runtime probe failed while loading the model. "
+                "Check pod GPU passthrough, driver, and CUDA runtime compatibility."
+            ) from exc
 
 
 def run_embed(config: EmbedConfig, backend: EmbeddingBackend | None = None) -> None:
@@ -106,6 +190,7 @@ def run_embed(config: EmbedConfig, backend: EmbeddingBackend | None = None) -> N
                 return
 
         _create_embeddings_table(conn=conn, rebuild=config.rebuild)
+        planned_rows = _planned_embed_rows(conn=conn, limit=config.limit)
 
         embed_backend = backend or HuggingFaceEmbeddingBackend(
             model_name=config.model_name,
@@ -113,7 +198,11 @@ def run_embed(config: EmbedConfig, backend: EmbeddingBackend | None = None) -> N
             max_length=config.max_length,
             device=config.device,
             normalize=config.normalize,
+            console=console,
         )
+        if hasattr(embed_backend, "runtime_summary"):
+            runtime_summary = str(embed_backend.runtime_summary())
+            console.log(f"Embedding runtime ready: {runtime_summary}")
 
         query = "SELECT anime_id, anime_text, prepared_at FROM anime_prep ORDER BY anime_id"
         if config.limit > 0:
@@ -124,43 +213,57 @@ def run_embed(config: EmbedConfig, backend: EmbeddingBackend | None = None) -> N
         rows_written = 0
         embedding_dim: int | None = None
 
-        while True:
-            batch = cursor.fetchmany(config.batch_size)
-            if not batch:
-                break
-            total_rows += len(batch)
-            texts = [str(row[1]) for row in batch]
-            vectors = embed_backend.embed_texts(texts)
-            if len(vectors) != len(batch):
-                raise RuntimeError("Embedding backend returned a mismatched number of vectors.")
-
-            values: list[tuple[Any, ...]] = []
-            for row, vector in zip(batch, vectors, strict=True):
-                if embedding_dim is None:
-                    embedding_dim = len(vector)
-                elif len(vector) != embedding_dim:
-                    raise RuntimeError("Inconsistent embedding dimensions returned by backend.")
-                values.append(
-                    (
-                        int(row[0]),
-                        sqlite3.Binary(_vector_to_blob(vector)),
-                        int(len(vector)),
-                        config.model_name,
-                        _now(),
-                        row[2],
-                    )
-                )
-
-            conn.executemany(
-                """
-                INSERT OR REPLACE INTO anime_embeddings(
-                    anime_id, embedding, embedding_dim, model_name, embedded_at, source_prepared_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                values,
+        progress_columns = (
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+        )
+        with Progress(*progress_columns, console=console) as progress:
+            embed_task = progress.add_task(
+                "[cyan]Embedding anime_text rows[/cyan]",
+                total=planned_rows,
             )
-            conn.commit()
-            rows_written += len(values)
+            while True:
+                batch = cursor.fetchmany(config.batch_size)
+                if not batch:
+                    break
+                total_rows += len(batch)
+                texts = [str(row[1]) for row in batch]
+                vectors = embed_backend.embed_texts(texts)
+                if len(vectors) != len(batch):
+                    raise RuntimeError("Embedding backend returned a mismatched number of vectors.")
+
+                values: list[tuple[Any, ...]] = []
+                for row, vector in zip(batch, vectors, strict=True):
+                    if embedding_dim is None:
+                        embedding_dim = len(vector)
+                    elif len(vector) != embedding_dim:
+                        raise RuntimeError("Inconsistent embedding dimensions returned by backend.")
+                    values.append(
+                        (
+                            int(row[0]),
+                            sqlite3.Binary(_vector_to_blob(vector)),
+                            int(len(vector)),
+                            config.model_name,
+                            _now(),
+                            row[2],
+                        )
+                    )
+
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO anime_embeddings(
+                        anime_id, embedding, embedding_dim, model_name, embedded_at, source_prepared_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+                conn.commit()
+                rows_written += len(values)
+                progress.advance(embed_task, advance=len(values))
 
         console.log(
             "Embed complete: "
@@ -174,12 +277,104 @@ def run_embed(config: EmbedConfig, backend: EmbeddingBackend | None = None) -> N
 def _resolve_device(device: str, torch_module: Any) -> str:
     normalized = device.strip().lower()
     if normalized == "auto":
-        return "cuda" if torch_module.cuda.is_available() else "cpu"
-    if normalized == "cuda" and not torch_module.cuda.is_available():
-        raise RuntimeError("CUDA device requested but no GPU is available.")
+        return "cuda" if _cuda_runtime_available(torch_module=torch_module) else "cpu"
+    if normalized == "cpu":
+        return "cpu"
+
+    if normalized == "cuda":
+        if not _cuda_runtime_available(torch_module=torch_module):
+            raise RuntimeError(
+                "CUDA device requested but no usable GPU is available. "
+                f"{_cuda_unavailable_reason(torch_module=torch_module)}"
+            )
+        return "cuda"
+
+    if normalized.startswith("cuda:"):
+        raw_index = normalized.split(":", 1)[1]
+        if not raw_index.isdigit():
+            raise RuntimeError(f"Unsupported CUDA device format: {device}")
+        if not _cuda_runtime_available(torch_module=torch_module):
+            raise RuntimeError(
+                f"CUDA device requested ({normalized}) but no usable GPU is available. "
+                f"{_cuda_unavailable_reason(torch_module=torch_module)}"
+            )
+        index = int(raw_index)
+        device_count = _safe_cuda_device_count(torch_module=torch_module)
+        if index >= device_count:
+            raise RuntimeError(
+                f"CUDA device index out of range: requested={index}, visible_devices={device_count}."
+            )
+        return normalized
+
     if normalized not in {"cpu", "cuda"}:
         raise RuntimeError(f"Unsupported device: {device}")
-    return normalized
+    return "cpu"
+
+
+def _cuda_runtime_available(torch_module: Any) -> bool:
+    try:
+        if bool(torch_module.cuda.is_available()):
+            return True
+    except Exception:
+        pass
+    return _safe_cuda_device_count(torch_module=torch_module) > 0
+
+
+def _safe_cuda_device_count(torch_module: Any) -> int:
+    try:
+        return int(torch_module.cuda.device_count())
+    except Exception:
+        return 0
+
+
+def _cuda_unavailable_reason(torch_module: Any) -> str:
+    parts: list[str] = []
+    nvidia_visible_devices = os.environ.get("NVIDIA_VISIBLE_DEVICES")
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if nvidia_visible_devices is not None:
+        parts.append(f"NVIDIA_VISIBLE_DEVICES={nvidia_visible_devices}")
+    if cuda_visible_devices is not None:
+        parts.append(f"CUDA_VISIBLE_DEVICES={cuda_visible_devices}")
+
+    built_with_cuda = False
+    try:
+        built_with_cuda = bool(torch_module.backends.cuda.is_built())
+    except Exception:
+        pass
+    parts.append(f"torch_cuda_built={built_with_cuda}")
+    parts.append(f"visible_cuda_devices={_safe_cuda_device_count(torch_module=torch_module)}")
+    cuinit_code, cuinit_name = _cuinit_probe()
+    if cuinit_code is not None:
+        parts.append(f"cuInit={cuinit_code}({cuinit_name or 'unknown'})")
+    elif cuinit_name:
+        parts.append(f"cuInit_probe_error={cuinit_name}")
+    return "CUDA diagnostics: " + ", ".join(parts)
+
+
+def _cuinit_probe() -> tuple[int | None, str | None]:
+    try:
+        import ctypes
+
+        libcuda = ctypes.CDLL("libcuda.so.1")
+        cu_init = libcuda.cuInit
+        cu_init.argtypes = [ctypes.c_uint]
+        cu_init.restype = ctypes.c_int
+        code = int(cu_init(0))
+
+        name: str | None = None
+        try:
+            get_error_name = libcuda.cuGetErrorName
+            get_error_name.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
+            get_error_name.restype = ctypes.c_int
+            raw_name = ctypes.c_char_p()
+            get_error_name(code, ctypes.byref(raw_name))
+            if raw_name.value is not None:
+                name = raw_name.value.decode()
+        except Exception:
+            name = None
+        return code, name
+    except Exception as exc:
+        return None, str(exc)
 
 
 def _extract_embeddings(outputs: Any, attention_mask: Any, torch_module: Any) -> Any:
@@ -238,6 +433,13 @@ def _table_row_count(conn: sqlite3.Connection, table_name: str) -> int:
     return int(conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
 
 
+def _planned_embed_rows(conn: sqlite3.Connection, limit: int) -> int:
+    total_rows = _table_row_count(conn, "anime_prep")
+    if limit > 0:
+        return min(limit, total_rows)
+    return total_rows
+
+
 def _vector_to_blob(vector: list[float]) -> bytes:
     packed = array("f", [float(v) for v in vector])
     return packed.tobytes()
@@ -251,4 +453,3 @@ def blob_to_vector(blob: bytes) -> list[float]:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
-
