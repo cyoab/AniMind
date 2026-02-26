@@ -1,0 +1,36 @@
+[project]
+name = "animind-tokenizer"
+version = "0.1.0"
+description = "Tokenizer pipeline for AniMind training corpora"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "pandas>=3.0.0",
+  "pyarrow>=23.0.0",
+  "rich>=14.3.2",
+  "torch>=2.5.0",
+  "transformers>=4.48.0",
+  "typer>=0.23.1",
+]
+
+[project.scripts]
+animind-tokenizer = "animind_tokenizer.cli:app"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4.2",
+]
+
+[build-system]
+requires = ["hatchling>=1.28.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/animind_tokenizer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
