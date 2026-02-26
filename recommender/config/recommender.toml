@@ -1,0 +1,18 @@
+[prep]
+source_db = "../../output/anilist.sqlite"
+semantic_ids_path = "../data/semantic_ids/conservative/semantic_ids.jsonl"
+out_dir = "../output"
+rebuild = true
+seed = 42
+target_examples = 400000
+split_task_a = 0.50
+split_task_b = 0.25
+split_task_c = 0.25
+max_task_a_templates_per_anime = 12
+task_b_min_history = 4
+task_b_max_history = 30
+task_b_mask_modes = ["last", "random"]
+task_b_positive_score_min = 7
+task_b_allowed_statuses = [1, 2, 3, 4, 6]
+export_parquet = false
+write_manifest = true

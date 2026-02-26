@@ -1,19 +1,45 @@
-# AniMind - Anime Recommendation System
+# AniMind
 
-## Dataset Build (New Pipeline)
+AniMind has three pipeline modules:
+
+- `dataset_builder`: scrapes/builds AniList-style user + anime data into SQLite/parquet
+- `tokenizer`: builds anime text/embeddings/RQ-VAE/Semantic IDs
+- `recommender`: builds LLM finetuning datasets from Semantic IDs and watch history
+
+## Dataset Builder
 
 ```bash
-cd /Users/yoab/Desktop/Projects/AniMind/dataset_builder
+cd /workspace/AniMind/dataset_builder
 uv sync
-docker compose -f ./docker/jikan-local.compose.yml up -d
-uv run animind-dataset build --phase all --target-users 10000 --out-dir ./output --include-nsfw
+uv run animind-dataset scrape --out-dir ../output --phase all
 ```
 
-Two-pass option:
+See `dataset_builder/README.md` for resume, bootstrap, and phase controls.
+
+## Tokenizer
 
 ```bash
-uv run animind-dataset build --phase interactions --target-users 10000 --out-dir ./output --include-nsfw
-uv run animind-dataset build --phase anime --run-id <run_id> --target-users 10000 --out-dir ./output --include-nsfw
+cd /workspace/AniMind/tokenizer
+uv sync
+uv run animind-tokenizer run --phase prep --config ./config/tokenizer.toml
+uv run animind-tokenizer run --phase embed --config ./config/tokenizer.toml
+uv run animind-tokenizer run --phase rqvae --config ./config/tokenizer.toml
+uv run animind-tokenizer run --phase tokenize --config ./config/tokenizer.toml
 ```
 
-See `/Users/yoab/Desktop/Projects/AniMind/dataset_builder/README.md` for all runtime profile and discovery-source options.
+See `tokenizer/README.md` for phase details and artifacts.
+
+## Recommender Prep Dataset
+
+```bash
+cd /workspace/AniMind/recommender
+uv sync
+uv run animind-recommender run --phase prep --config ./config/recommender.toml
+```
+
+Output files are written to the configured `out_dir`:
+
+- `llm_prep_train.jsonl`
+- `llm_prep_summary.json`
+- `llm_prep_manifest.json`
+- `llm_prep_train.parquet` (optional)

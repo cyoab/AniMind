@@ -1,0 +1,34 @@
+[project]
+name = "animind-recommender"
+version = "0.1.0"
+description = "LLM dataset prep pipeline for AniMind semantic-id recommender tasks"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "pandas>=3.0.0",
+  "pyarrow>=23.0.0",
+  "rich>=14.3.2",
+  "typer>=0.23.1",
+]
+
+[project.scripts]
+animind-recommender = "animind_recommender.cli:app"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4.2",
+]
+
+[build-system]
+requires = ["hatchling>=1.28.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/animind_recommender"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
