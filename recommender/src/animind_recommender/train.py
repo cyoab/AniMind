@@ -197,11 +197,17 @@ def run_train(config: TrainConfig) -> None:
                     "[yellow]Skipping LoRA in local dry-run fallback model.[/yellow]"
                 )
             else:
+                resolved_target_modules = _resolve_lora_target_modules(
+                    model=model,
+                    configured_target_modules=effective_config.lora.target_modules,
+                    dry_run=effective_config.dry_run,
+                    console=console,
+                )
                 lora_cfg = PeftLoraConfig(
                     r=effective_config.lora.r,
                     lora_alpha=effective_config.lora.alpha,
                     lora_dropout=effective_config.lora.dropout,
-                    target_modules=effective_config.lora.target_modules,
+                    target_modules=resolved_target_modules,
                     task_type="CAUSAL_LM",
                 )
                 model = get_peft_model(model, lora_cfg)
@@ -615,6 +621,97 @@ def _count_trainable_params(model: Any) -> tuple[int, int]:
         if bool(parameter.requires_grad):
             trainable += value
     return trainable, total
+
+
+def _resolve_lora_target_modules(
+    *,
+    model: Any,
+    configured_target_modules: list[str],
+    dry_run: bool,
+    console: Console,
+) -> list[str]:
+    def _matches(module_name: str, target: str) -> bool:
+        return module_name == target or module_name.endswith(f".{target}")
+
+    module_names: list[str] = []
+    suffix_counts: dict[str, int] = {}
+    for module_name, module in model.named_modules():
+        if not module_name:
+            continue
+        weight = getattr(module, "weight", None)
+        if weight is None or int(getattr(weight, "ndim", 0)) < 2:
+            continue
+        module_names.append(module_name)
+        suffix = module_name.rsplit(".", 1)[-1]
+        suffix_counts[suffix] = int(suffix_counts.get(suffix, 0)) + 1
+
+    if not module_names:
+        raise RuntimeError("Unable to resolve LoRA targets: base model exposes no eligible weight-bearing modules.")
+
+    requested = [str(value).strip() for value in configured_target_modules if str(value).strip()]
+    resolved = [target for target in requested if any(_matches(name, target) for name in module_names)]
+    missing = [target for target in requested if target not in resolved]
+
+    if missing and dry_run:
+        console.log(
+            "[yellow]Dry-run LoRA target fallback:[/yellow] "
+            f"configured targets missing in model={missing}; auto-resolving against available modules."
+        )
+    elif missing:
+        available_suffixes = sorted(suffix_counts.keys())
+        preview = ", ".join(available_suffixes[:32])
+        if len(available_suffixes) > 32:
+            preview += ", ..."
+        raise ValueError(
+            "Configured LoRA target modules were not found in the base model. "
+            f"missing={missing}; available_suffixes=[{preview}]"
+        )
+
+    if resolved:
+        return resolved
+
+    fallback_priority = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "c_attn",
+        "c_proj",
+        "c_fc",
+        "query_key_value",
+        "dense",
+        "dense_h_to_4h",
+        "dense_4h_to_h",
+    ]
+    fallback = [target for target in fallback_priority if any(_matches(name, target) for name in module_names)]
+    if fallback:
+        console.log(f"[yellow]Using fallback LoRA target modules:[/yellow] {fallback}")
+        return fallback
+
+    suffix_ranked = sorted(
+        suffix_counts.items(),
+        key=lambda item: (-item[1], item[0]),
+    )
+    excluded_suffixes = {"lm_head", "embed_tokens", "wte", "wpe"}
+    generic = [suffix for suffix, _ in suffix_ranked if suffix not in excluded_suffixes][:4]
+    if generic:
+        console.log(
+            "[yellow]Using generic LoRA target fallback modules:[/yellow] "
+            f"{generic} (derived from model module suffix frequency)."
+        )
+        return generic
+
+    available_suffixes = sorted(suffix_counts.keys())
+    preview = ", ".join(available_suffixes[:32])
+    if len(available_suffixes) > 32:
+        preview += ", ..."
+    raise ValueError(
+        "Unable to resolve LoRA target modules for this model. "
+        f"configured={requested}; available_suffixes=[{preview}]"
+    )
 
 
 def _build_runtime_table(

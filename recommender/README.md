@@ -107,6 +107,7 @@ On this host, CUDA and external network may be unavailable. In that case dry-run
 
 - downgrades precision to `float32` when CUDA is unavailable
 - uses `train.dry_run_model_name` fallback if base model retrieval fails
+- auto-resolves LoRA `target_modules` for dry-run model architectures (for example GPT-2 `c_attn/c_proj/c_fc`)
 - falls back to synthetic general-mix rows and local English eval texts when dataset downloads fail
 
 For full training, set:
