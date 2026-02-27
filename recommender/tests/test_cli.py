@@ -6,7 +6,9 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+import animind_recommender.cli as cli_module
 from animind_recommender.cli import app
+from animind_recommender.train_types import TrainConfig
 
 
 def _make_source_db(path: Path) -> None:
@@ -136,3 +138,38 @@ def test_cli_run_phase_prep_smoke(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert (out_dir / "llm_prep_train.jsonl").exists()
     assert (out_dir / "llm_prep_summary.json").exists()
+
+
+def test_cli_run_phase_train_dispatch(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "recommender.toml"
+    config_path.write_text("[prep]\n", encoding="utf-8")
+    marker = {"called": False}
+
+    def _patched_build_train_config(config_path: Path) -> TrainConfig:
+        _ = config_path
+        return TrainConfig(
+            train_jsonl=tmp_path / "dummy.jsonl",
+            out_dir=tmp_path / "train_out",
+            tokens=TrainConfig().tokens,
+        )
+
+    def _patched_run_train(config: TrainConfig) -> None:
+        marker["called"] = True
+        assert isinstance(config, TrainConfig)
+
+    monkeypatch.setattr(cli_module, "build_train_config", _patched_build_train_config)
+    monkeypatch.setattr(cli_module, "run_train", _patched_run_train)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--phase",
+            "train",
+            "--config",
+            str(config_path),
+        ],
+    )
+    assert result.exit_code == 0
+    assert marker["called"] is True

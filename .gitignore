@@ -221,3 +221,4 @@ __marimo__/
 /tokenizer/output/
 /tokenizer/wandb/
 /recommender/output/
+/recommender/wandb/

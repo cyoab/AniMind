@@ -8,6 +8,7 @@ Phase-based CLI for generating LLM finetuning datasets over AniMind semantic IDs
 cd /workspace/AniMind/recommender
 uv sync
 uv run animind-recommender run --phase prep --config ./config/recommender.toml
+uv run animind-recommender run --phase train --config ./config/recommender.toml
 ```
 
 ## Phase: `prep`
@@ -64,3 +65,52 @@ Each JSONL row includes:
 - `anime_ids`
 - `user_id` (nullable)
 - `meta` (template/mask metadata)
+
+## Phase: `train`
+
+`train` fine-tunes `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B` in two ordered stages:
+
+- Phase 1 (linking): Task A-weighted training
+- Phase 2 (reasoning): Task B/C-weighted training
+
+Key behaviors:
+
+- Reuses tokenizer-style runtime checks for CUDA device + dtype resolution
+- Extends tokenizer with semantic tokens and resizes model embeddings
+- Optional warm-start for SID tokens from RQ-VAE codebook projection
+- Mixes general instruction data (SlimOrca + OpenHermes) at configurable ratio
+- English retention monitor via WikiText-2 perplexity every N steps
+- Checkpoints saved every `train.checkpoint_every_steps`
+- W&B integration (`train.wandb`)
+- Dry-run mode for full wiring validation (`train.dry_run`)
+
+Primary outputs (under `[train].out_dir`, or dry-run subdir):
+
+- `phase1_linking/` checkpoints + best model
+- `phase2_reasoning/` checkpoints + best model
+- `final_model/`
+- `tokenizer/`
+- `train_run_summary.json`
+- `train_config_snapshot.json`
+
+### Dry-run first
+
+Default config ships with `train.dry_run = true` so you can validate the full training pipeline before a full run.
+
+```bash
+cd /workspace/AniMind/recommender
+uv sync
+uv run animind-recommender run --phase train --config ./config/recommender.toml
+```
+
+On this host, CUDA and external network may be unavailable. In that case dry-run automatically:
+
+- downgrades precision to `float32` when CUDA is unavailable
+- uses `train.dry_run_model_name` fallback if base model retrieval fails
+- falls back to synthetic general-mix rows and local English eval texts when dataset downloads fail
+
+For full training, set:
+
+- `train.dry_run = false`
+- valid `HF_TOKEN` if needed for model access
+- optional W&B settings under `[train.wandb]`
