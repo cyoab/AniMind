@@ -18,6 +18,12 @@ uv run animind-recommender run --phase prep --config ./config/recommender.toml
 - Task B: masked watch-sequence prediction
 - Task C: template-based reasoning prompts from metadata overlap
 
+Run-time visibility:
+
+- Rich stage progress bar (`1/8` through `8/8`)
+- Rich logs for loaded row counts and generated pool sizes
+- Periodic scan logs during large `user_anime` passes
+
 Primary outputs (under `[prep].out_dir`):
 
 - `llm_prep_train.jsonl`

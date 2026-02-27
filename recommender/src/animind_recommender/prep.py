@@ -10,6 +10,15 @@ from pathlib import Path
 from typing import Any, Iterable, Literal
 
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 
 PREP_PHASE = Literal["prep"]
 DEFAULT_ALLOWED_STATUSES = [1, 2, 3, 4, 6]
@@ -121,92 +130,139 @@ def run_prep(config: PrepConfig) -> None:
     generated_at = _now()
     quotas = _compute_quotas(config=config)
     rng = random.Random(config.seed)
-
-    semantic_map = _load_semantic_map(config.semantic_ids_path)
-    anime_meta = _load_anime_meta(config.source_db, required_ids=set(semantic_map.keys()))
-    if not anime_meta:
-        raise RuntimeError("No anime metadata rows could be loaded from source database.")
-
-    task_a_pool, task_a_stats = _build_task_a_pool(
-        semantic_map=semantic_map,
-        anime_meta=anime_meta,
-        max_templates_per_anime=config.max_task_a_templates_per_anime,
-    )
-    task_b_pool, task_c_seed_pool, stream_stats = _build_task_b_and_task_c_seeds(
-        config=config,
-        semantic_map=semantic_map,
-        desired_task_b_pool=max(quotas.task_b * 2, 1),
-        desired_task_c_seed_pool=max(quotas.task_c * 2, 1),
-    )
-    task_c_pool, task_c_stats = _build_task_c_pool(
-        task_c_seed_pool=task_c_seed_pool,
-        semantic_map=semantic_map,
-        anime_meta=anime_meta,
+    console.rule("[bold cyan]Recommender Prep Dataset[/bold cyan]")
+    console.log(
+        "Starting prep run with "
+        f"target_examples={config.target_examples:,}, "
+        f"quota(A/B/C)={quotas.task_a:,}/{quotas.task_b:,}/{quotas.task_c:,}, "
+        f"seed={config.seed}."
     )
 
-    task_a_rows = _sample_to_quota(task_a_pool, quotas.task_a, rng=rng)
-    task_b_rows = _sample_to_quota(task_b_pool, quotas.task_b, rng=rng)
-    task_c_rows = _sample_to_quota(task_c_pool, quotas.task_c, rng=rng)
+    stage_columns = (
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+    )
 
-    all_rows = [*task_a_rows, *task_b_rows, *task_c_rows]
-    if len(all_rows) != config.target_examples:
-        raise RuntimeError(
-            "Generated row count does not match target_examples: "
-            f"got {len(all_rows)} expected {config.target_examples}"
+    with Progress(*stage_columns, console=console) as stage_progress:
+        stage_task = stage_progress.add_task("[cyan]Prep stages[/cyan]", total=8)
+
+        stage_progress.update(stage_task, description="[cyan]1/8 Load semantic ID map[/cyan]")
+        semantic_map = _load_semantic_map(config.semantic_ids_path)
+        stage_progress.advance(stage_task)
+        console.log(f"Loaded semantic map rows: {len(semantic_map):,}")
+
+        stage_progress.update(stage_task, description="[cyan]2/8 Load anime metadata[/cyan]")
+        anime_meta = _load_anime_meta(config.source_db, required_ids=set(semantic_map.keys()))
+        if not anime_meta:
+            raise RuntimeError("No anime metadata rows could be loaded from source database.")
+        stage_progress.advance(stage_task)
+        console.log(f"Loaded anime metadata rows: {len(anime_meta):,}")
+
+        stage_progress.update(stage_task, description="[cyan]3/8 Build Task A pool[/cyan]")
+        task_a_pool, task_a_stats = _build_task_a_pool(
+            semantic_map=semantic_map,
+            anime_meta=anime_meta,
+            max_templates_per_anime=config.max_task_a_templates_per_anime,
+        )
+        stage_progress.advance(stage_task)
+        console.log(f"Task A pool size: {len(task_a_pool):,}")
+
+        stage_progress.update(stage_task, description="[cyan]4/8 Build Task B/C seed pools[/cyan]")
+        task_b_pool, task_c_seed_pool, stream_stats = _build_task_b_and_task_c_seeds(
+            config=config,
+            semantic_map=semantic_map,
+            desired_task_b_pool=max(quotas.task_b * 2, 1),
+            desired_task_c_seed_pool=max(quotas.task_c * 2, 1),
+            console=console,
+        )
+        stage_progress.advance(stage_task)
+        console.log(
+            "Task B/C seed pools: "
+            f"task_b_pool={len(task_b_pool):,}, task_c_seed_pool={len(task_c_seed_pool):,}."
         )
 
-    rng.shuffle(all_rows)
-    for index, row in enumerate(all_rows, start=1):
-        row["example_id"] = f"prep_{index:09d}"
+        stage_progress.update(stage_task, description="[cyan]5/8 Build Task C pool[/cyan]")
+        task_c_pool, task_c_stats = _build_task_c_pool(
+            task_c_seed_pool=task_c_seed_pool,
+            semantic_map=semantic_map,
+            anime_meta=anime_meta,
+        )
+        stage_progress.advance(stage_task)
+        console.log(f"Task C pool size: {len(task_c_pool):,}")
 
-    _write_jsonl(config.output_jsonl, all_rows)
-    if config.export_parquet:
-        _write_parquet(config.output_parquet, all_rows)
+        stage_progress.update(stage_task, description="[cyan]6/8 Sample quotas and shuffle[/cyan]")
+        task_a_rows = _sample_to_quota(task_a_pool, quotas.task_a, rng=rng)
+        task_b_rows = _sample_to_quota(task_b_pool, quotas.task_b, rng=rng)
+        task_c_rows = _sample_to_quota(task_c_pool, quotas.task_c, rng=rng)
 
-    per_task_counts = Counter(row["task"] for row in all_rows)
-    summary = {
-        "generated_at": generated_at,
-        "target_examples": config.target_examples,
-        "counts": {
-            "task_a": int(per_task_counts.get("A", 0)),
-            "task_b": int(per_task_counts.get("B", 0)),
-            "task_c": int(per_task_counts.get("C", 0)),
-        },
-        "quotas": asdict(quotas),
-        "pool_sizes": {
-            "task_a_pool": len(task_a_pool),
-            "task_b_pool": len(task_b_pool),
-            "task_c_pool": len(task_c_pool),
-            "task_c_seed_pool": len(task_c_seed_pool),
-        },
-        "task_a_stats": task_a_stats,
-        "stream_stats": stream_stats,
-        "task_c_stats": task_c_stats,
-        "semantic_rows": len(semantic_map),
-        "anime_meta_rows": len(anime_meta),
-    }
-    _write_json(config.summary_json, summary)
+        all_rows = [*task_a_rows, *task_b_rows, *task_c_rows]
+        if len(all_rows) != config.target_examples:
+            raise RuntimeError(
+                "Generated row count does not match target_examples: "
+                f"got {len(all_rows)} expected {config.target_examples}"
+            )
 
-    if config.write_manifest:
-        manifest = {
+        rng.shuffle(all_rows)
+        for index, row in enumerate(all_rows, start=1):
+            row["example_id"] = f"prep_{index:09d}"
+        stage_progress.advance(stage_task)
+
+        stage_progress.update(stage_task, description="[cyan]7/8 Write training artifacts[/cyan]")
+        _write_jsonl(config.output_jsonl, all_rows)
+        if config.export_parquet:
+            _write_parquet(config.output_parquet, all_rows)
+        stage_progress.advance(stage_task)
+
+        stage_progress.update(stage_task, description="[cyan]8/8 Write summary and manifest[/cyan]")
+        per_task_counts = Counter(row["task"] for row in all_rows)
+        summary = {
             "generated_at": generated_at,
-            "output_jsonl": str(config.output_jsonl),
-            "output_parquet": str(config.output_parquet) if config.export_parquet else None,
-            "summary_json": str(config.summary_json),
-            "source_db": str(config.source_db),
-            "semantic_ids_path": str(config.semantic_ids_path),
-            "config": {
-                **asdict(config),
+            "target_examples": config.target_examples,
+            "counts": {
+                "task_a": int(per_task_counts.get("A", 0)),
+                "task_b": int(per_task_counts.get("B", 0)),
+                "task_c": int(per_task_counts.get("C", 0)),
+            },
+            "quotas": asdict(quotas),
+            "pool_sizes": {
+                "task_a_pool": len(task_a_pool),
+                "task_b_pool": len(task_b_pool),
+                "task_c_pool": len(task_c_pool),
+                "task_c_seed_pool": len(task_c_seed_pool),
+            },
+            "task_a_stats": task_a_stats,
+            "stream_stats": stream_stats,
+            "task_c_stats": task_c_stats,
+            "semantic_rows": len(semantic_map),
+            "anime_meta_rows": len(anime_meta),
+        }
+        _write_json(config.summary_json, summary)
+
+        if config.write_manifest:
+            manifest = {
+                "generated_at": generated_at,
+                "output_jsonl": str(config.output_jsonl),
+                "output_parquet": str(config.output_parquet) if config.export_parquet else None,
+                "summary_json": str(config.summary_json),
                 "source_db": str(config.source_db),
                 "semantic_ids_path": str(config.semantic_ids_path),
-                "out_dir": str(config.out_dir),
-            },
-        }
-        _write_json(config.manifest_json, manifest)
+                "config": {
+                    **asdict(config),
+                    "source_db": str(config.source_db),
+                    "semantic_ids_path": str(config.semantic_ids_path),
+                    "out_dir": str(config.out_dir),
+                },
+            }
+            _write_json(config.manifest_json, manifest)
+        stage_progress.advance(stage_task)
 
     console.log(
         "Prep complete: "
-        f"rows={len(all_rows):,}, "
+        f"rows={config.target_examples:,}, "
         f"task_a={per_task_counts.get('A', 0):,}, "
         f"task_b={per_task_counts.get('B', 0):,}, "
         f"task_c={per_task_counts.get('C', 0):,}, "
@@ -428,6 +484,7 @@ def _build_task_b_and_task_c_seeds(
     semantic_map: dict[int, SemanticAnime],
     desired_task_b_pool: int,
     desired_task_c_seed_pool: int,
+    console: Console | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     allowed_statuses = sorted(set(int(v) for v in config.task_b_allowed_statuses))
     placeholders = ",".join("?" for _ in allowed_statuses)
@@ -536,6 +593,14 @@ def _build_task_b_and_task_c_seeds(
                         "anime_ids": [int(liked_ids[0]), int(liked_ids[1]), int(liked_ids[2])],
                         "user_id": int(user_id),
                     }
+                )
+            if console is not None and users_scanned > 0 and users_scanned % 25_000 == 0:
+                console.log(
+                    "Task B/C scan progress: "
+                    f"users={users_scanned:,}, "
+                    f"rows={rows_scanned:,}, "
+                    f"task_b_pool={len(task_b_rows):,}, "
+                    f"task_c_seed_pool={len(task_c_seeds):,}."
                 )
 
         for user_id_raw, anime_id_raw, score_raw, status_raw, watched_raw, scraped_at_raw in cursor:

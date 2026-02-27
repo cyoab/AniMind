@@ -220,3 +220,4 @@ __marimo__/
 /dataset_builder/output/
 /tokenizer/output/
 /tokenizer/wandb/
+/recommender/output/
